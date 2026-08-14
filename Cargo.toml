@@ -2,13 +2,18 @@
 name = "serial-mcp"
 version = "0.1.0"
 edition = "2024"
-description = "Windows x64 serial-port MCP stdio server for embedded UART consoles"
+description = "Windows x64 serial-port MCP Streamable HTTP server for embedded UART consoles"
 license = "MIT"
 
 [dependencies]
+axum = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serialport = "4"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
 
 [profile.release]
 lto = true

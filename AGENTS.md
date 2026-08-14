@@ -4,9 +4,9 @@
 
 ## 项目概览
 
-- `serial-mcp` 是一个 Windows x64 串口 MCP stdio 服务，供 Codex/Claude Code 等客户端调用，用于操作嵌入式开发板的 UART 调试串口。
-- 技术栈：Rust 2024，依赖 `serde`、`serde_json`、`serialport`。
-- 进程通过 stdin 读取 JSON-RPC 请求，通过 stdout 返回响应；诊断日志只能写 stderr，禁止手动交互运行。
+- `serial-mcp` 是一个 Windows x64 串口 MCP Streamable HTTP 服务，供 Codex/Claude Code 等客户端调用，用于操作嵌入式开发板的 UART 调试串口。
+- 技术栈：Rust 2024，依赖 `axum`、`tokio`、`serde`、`serde_json`、`serialport`。
+- 进程默认监听 `127.0.0.1:8765`，通过 `POST /mcp` 接收 JSON-RPC 请求；诊断日志只能写 stderr。
 - 目标平台为 Windows；`.cargo/config.toml` 已启用 `crt-static`，release 产物不依赖 `VCRUNTIME140.dll`。
 
 ## 常用命令
@@ -26,8 +26,11 @@ cargo build --release
 ## 代码结构
 
 - `src/main.rs`
-  - 程序入口：解析 `--help`/`-h`，然后进入 stdin 的 JSON-RPC 行循环。
-  - 解析失败时返回 `-32700 parse error`；stdout 写入失败时退出。
+  - 程序入口：解析 `--help`/`-h` 和 `--bind`，启动 Tokio/Axum HTTP 服务。
+  - 默认只绑定回环地址；非回环绑定会输出无身份验证警告。
+- `src/http_transport.rs`
+  - MCP Streamable HTTP 传输层：处理 `POST /mcp`、HTTP 请求头校验和 JSON-RPC 解析错误。
+  - 串口操作通过 blocking task 串行访问共享 `SerialHub`；通知返回 `202`，`GET /mcp` 返回 `405`。
 - `src/mcp.rs`
   - MCP/JSON-RPC 协议层：`handle_message` 分发 `initialize`、`ping`、`tools/list`、`tools/call` 等消息。
   - 定义全部 9 个 MCP 工具的参数结构、默认值、输入校验和 `inputSchema`。

@@ -6,6 +6,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-03-26", MCP_PROTOCOL_VERSION];
 pub const SERVER_NAME: &str = "serial-mcp";
 
 struct ToolError {
@@ -32,10 +33,18 @@ impl ToolError {
 pub fn handle_message(message: Value, hub: &mut SerialHub) -> Option<Value> {
     let id = message.get("id").cloned();
     if message.get("jsonrpc") != Some(&Value::String("2.0".to_string())) {
-        return id.map(|id| rpc_error(id, -32600, "invalid JSON-RPC request"));
+        return Some(rpc_error(
+            id.unwrap_or(Value::Null),
+            -32600,
+            "invalid JSON-RPC request",
+        ));
     }
     let Some(method) = message.get("method").and_then(Value::as_str) else {
-        return id.map(|id| rpc_error(id, -32600, "method must be a string"));
+        return Some(rpc_error(
+            id.unwrap_or(Value::Null),
+            -32600,
+            "method must be a string",
+        ));
     };
     match method {
         "initialize" => initialize(id, message.get("params")),
@@ -49,6 +58,10 @@ pub fn handle_message(message: Value, hub: &mut SerialHub) -> Option<Value> {
 
 fn initialize(id: Option<Value>, params: Option<&Value>) -> Option<Value> {
     let id = id?;
+    let requested_version = params
+        .and_then(Value::as_object)
+        .and_then(|params| params.get("protocolVersion"))
+        .and_then(Value::as_str);
     let valid = params.and_then(Value::as_object).is_some_and(|params| {
         params
             .get("protocolVersion")
@@ -69,10 +82,13 @@ fn initialize(id: Option<Value>, params: Option<&Value>) -> Option<Value> {
     if !valid {
         return Some(rpc_error(id, -32602, "invalid initialize params"));
     }
+    let protocol_version = requested_version
+        .filter(|version| SUPPORTED_PROTOCOL_VERSIONS.contains(version))
+        .unwrap_or(MCP_PROTOCOL_VERSION);
     Some(rpc_result(
         id,
         json!({
-            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "protocolVersion": protocol_version,
             "capabilities": {"tools": {}},
             "serverInfo": {"name": SERVER_NAME, "version": env!("CARGO_PKG_VERSION")},
             "instructions": "Windows x64 serial-port console. Open a COM port, then read/write bytes for an embedded UART terminal."
@@ -721,6 +737,26 @@ mod tests {
 
         assert_eq!(response["result"]["protocolVersion"], "2025-06-18");
         assert_eq!(response["result"]["serverInfo"]["name"], "serial-mcp");
+    }
+
+    #[test]
+    fn initialize_negotiates_supported_older_version() {
+        let mut hub = SerialHub::new();
+        let response = handle_message(
+            message(
+                "initialize",
+                Some(1),
+                json!({
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "clientInfo": {"name": "codex", "version": "1.0"}
+                }),
+            ),
+            &mut hub,
+        )
+        .unwrap();
+
+        assert_eq!(response["result"]["protocolVersion"], "2025-03-26");
     }
 
     #[test]
