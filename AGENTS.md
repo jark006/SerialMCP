@@ -5,7 +5,7 @@
 ## 项目概览
 
 - `serial-mcp` 是一个 Windows x64 串口 MCP Streamable HTTP 服务，供 Codex/Claude Code 等客户端调用，用于操作嵌入式开发板的 UART 调试串口。
-- 技术栈：Rust 2024，依赖 `axum`、`tokio`、`serde`、`serde_json`、`serialport`。
+- 技术栈：Rust 2024，依赖 `axum`、`tokio`、`serde`、`serde_json`、`serialport`、`zmodem2`。
 - 进程默认监听 `127.0.0.1:8765`，通过 `POST /mcp` 接收 JSON-RPC 请求；诊断日志只能写 stderr。
 - 目标平台为 Windows；`.cargo/config.toml` 已启用 `crt-static`，release 产物不依赖 `VCRUNTIME140.dll`。
 
@@ -33,10 +33,14 @@ cargo build --release
   - 串口操作通过 blocking task 串行访问共享 `SerialHub`；通知返回 `202`，`GET /mcp` 返回 `405`。
 - `src/mcp.rs`
   - MCP/JSON-RPC 协议层：`handle_message` 分发 `initialize`、`ping`、`tools/list`、`tools/call` 等消息。
-  - 定义全部 9 个 MCP 工具的参数结构、默认值、输入校验和 `inputSchema`。
+  - 定义全部 MCP 工具的参数结构、默认值、输入校验和 `inputSchema`。
   - 包含协议层单元测试，例如初始化响应、通知无响应、工具列表、hex 解析。
+- `src/modem.rs`
+  - XMODEM/XMODEM-1K 与 YMODEM 协议核心，包含 CRC、块序号、NAK 重传、取消和批结束处理。
+  - 通过内存双工流测试发送端与接收端的完整协议会话。
 - `src/serial.rs`
   - 串口业务层：`SerialHub` 管理打开端口、活动端口和串口参数。
+  - 文件传输以“启动远端命令 + 完整协议会话”的原子操作执行；ZMODEM 由 `zmodem2` 状态机驱动。
   - 包含纯函数与参数解析单元测试，例如端口规范化、VID/PID 格式化、串口参数解析。
   - 真实串口硬件操作无法在单测中覆盖，只测试可脱离硬件验证的逻辑。
 

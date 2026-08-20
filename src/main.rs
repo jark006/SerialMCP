@@ -1,5 +1,6 @@
 mod http_transport;
 mod mcp;
+mod modem;
 mod serial;
 
 use std::{net::SocketAddr, process::ExitCode};

@@ -9,6 +9,7 @@ pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-03-26", MCP_PROTOCOL_VERSION];
 pub const SERVER_NAME: &str = "serial-mcp";
 
+#[derive(Debug)]
 struct ToolError {
     kind: String,
     message: String,
@@ -91,7 +92,7 @@ fn initialize(id: Option<Value>, params: Option<&Value>) -> Option<Value> {
             "protocolVersion": protocol_version,
             "capabilities": {"tools": {}},
             "serverInfo": {"name": SERVER_NAME, "version": env!("CARGO_PKG_VERSION")},
-            "instructions": "Serial console for embedded Linux on Windows. Recommended workflow: serial_list_ports, serial_open, then serial_run_command. After USB hot-plug, call serial_status and serial_reconnect. Use serial_read/serial_write for raw byte-level interaction."
+            "instructions": "Serial console for embedded Linux on Windows. Recommended workflow: serial_list_ports, serial_open, then serial_check_modem_tools or serial_send_file/serial_receive_file for atomic X/Y/ZMODEM transfers. After USB hot-plug, call serial_status and serial_reconnect. Use serial_read/serial_write for raw byte-level interaction."
         }),
     ))
 }
@@ -206,6 +207,43 @@ fn call_tool(id: Value, params: Option<&Value>, hub: &mut SerialHub) -> Value {
                     args.until.as_deref().map(str::as_bytes),
                     args.clear_input,
                     args.strip_ansi,
+                )
+                .map(|value| json!(value))
+                .map_err(ToolError::tool)
+            }),
+        "serial_check_modem_tools" => decode::<ModemToolCheckArgs>(&arguments)
+            .and_then(validate_modem_tool_check_args)
+            .and_then(|args| {
+                hub.check_modem_tools(args.port.as_deref(), args.timeout_ms)
+                    .map(|value| json!(value))
+                    .map_err(ToolError::tool)
+            }),
+        "serial_send_file" => decode::<FileTransferArgs>(&arguments)
+            .and_then(validate_send_file_args)
+            .and_then(|args| {
+                let command = transfer_command(&args, true)?;
+                hub.send_file(
+                    args.port.as_deref(),
+                    &args.protocol,
+                    &args.local_path,
+                    args.remote_path.as_deref(),
+                    command.as_deref(),
+                    args.timeout_ms,
+                )
+                .map(|value| json!(value))
+                .map_err(ToolError::tool)
+            }),
+        "serial_receive_file" => decode::<FileTransferArgs>(&arguments)
+            .and_then(validate_receive_file_args)
+            .and_then(|args| {
+                let command = transfer_command(&args, false)?;
+                hub.receive_file(
+                    args.port.as_deref(),
+                    &args.protocol,
+                    &args.local_path,
+                    args.remote_path.as_deref(),
+                    command.as_deref(),
+                    args.timeout_ms,
                 )
                 .map(|value| json!(value))
                 .map_err(ToolError::tool)
@@ -388,6 +426,29 @@ struct SetControlArgs {
     break_ms: Option<u64>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileTransferArgs {
+    port: Option<String>,
+    #[serde(default = "default_modem_protocol")]
+    protocol: String,
+    local_path: String,
+    remote_path: Option<String>,
+    command: Option<String>,
+    #[serde(default = "default_true")]
+    start_command: bool,
+    #[serde(default = "default_transfer_timeout_ms")]
+    timeout_ms: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModemToolCheckArgs {
+    port: Option<String>,
+    #[serde(default = "default_transfer_timeout_ms")]
+    timeout_ms: u64,
+}
+
 fn default_baud_rate() -> u32 {
     DEFAULT_BAUD_RATE
 }
@@ -435,6 +496,12 @@ fn default_direction() -> String {
 }
 fn default_true() -> bool {
     true
+}
+fn default_modem_protocol() -> String {
+    "zmodem".to_string()
+}
+fn default_transfer_timeout_ms() -> u64 {
+    10_000
 }
 
 fn validate_open_args(args: OpenArgs) -> Result<OpenArgs, ToolError> {
@@ -599,6 +666,133 @@ fn validate_set_control_args(args: SetControlArgs) -> Result<SetControlArgs, Too
     Ok(args)
 }
 
+fn validate_send_file_args(args: FileTransferArgs) -> Result<FileTransferArgs, ToolError> {
+    validate_file_transfer_args(&args)?;
+    if args.start_command
+        && args.command.is_none()
+        && matches!(args.protocol.as_str(), "xmodem" | "xmodem-1k")
+        && args.remote_path.as_deref().is_none_or(str::is_empty)
+    {
+        return Err(ToolError::invalid_params(
+            "remote_path is required for an automatic XMODEM receive command",
+        ));
+    }
+    Ok(args)
+}
+
+fn validate_receive_file_args(args: FileTransferArgs) -> Result<FileTransferArgs, ToolError> {
+    validate_file_transfer_args(&args)?;
+    if args.start_command
+        && args.command.is_none()
+        && args.remote_path.as_deref().is_none_or(str::is_empty)
+    {
+        return Err(ToolError::invalid_params(
+            "remote_path is required for an automatic send command",
+        ));
+    }
+    Ok(args)
+}
+
+fn validate_file_transfer_args(args: &FileTransferArgs) -> Result<(), ToolError> {
+    if let Some(port) = args.port.as_deref() {
+        validate_port_string(port)?;
+    }
+    if args.local_path.trim().is_empty() {
+        return Err(ToolError::invalid_params("local_path must not be empty"));
+    }
+    if let Some(remote_path) = args.remote_path.as_deref()
+        && remote_path.trim().is_empty()
+    {
+        return Err(ToolError::invalid_params("remote_path must not be empty"));
+    }
+    if !matches!(
+        args.protocol.as_str(),
+        "xmodem" | "xmodem-1k" | "ymodem" | "zmodem"
+    ) {
+        return Err(ToolError::invalid_params(
+            "protocol must be xmodem, xmodem-1k, ymodem, or zmodem",
+        ));
+    }
+    if let Some(command) = args.command.as_deref() {
+        if command.trim().is_empty() {
+            return Err(ToolError::invalid_params("command must not be empty"));
+        }
+        if !args.start_command {
+            return Err(ToolError::invalid_params(
+                "command cannot be used when start_command is false",
+            ));
+        }
+    }
+    validate_timeout(args.timeout_ms)
+}
+
+fn validate_modem_tool_check_args(
+    args: ModemToolCheckArgs,
+) -> Result<ModemToolCheckArgs, ToolError> {
+    if let Some(port) = args.port.as_deref() {
+        validate_port_string(port)?;
+    }
+    validate_timeout(args.timeout_ms)?;
+    Ok(args)
+}
+
+fn transfer_command(args: &FileTransferArgs, sending: bool) -> Result<Option<String>, ToolError> {
+    if !args.start_command {
+        return Ok(None);
+    }
+    if let Some(command) = args.command.as_ref() {
+        return Ok(Some(command.clone()));
+    }
+    if sending {
+        Ok(Some(match args.protocol.as_str() {
+            "xmodem" | "xmodem-1k" => modem_command(
+                "lrz",
+                &format!(
+                    "-X -c -y {}",
+                    shell_quote(args.remote_path.as_deref().unwrap_or_default())
+                ),
+                "rx",
+                &shell_quote(args.remote_path.as_deref().unwrap_or_default()),
+            ),
+            "ymodem" => modem_command("lrz", "--ymodem -y", "rb", ""),
+            "zmodem" => modem_command("lrz", "-y", "rz", "-y"),
+            _ => return Err(ToolError::invalid_params("unsupported modem protocol")),
+        }))
+    } else {
+        let remote_path = shell_quote(args.remote_path.as_deref().unwrap_or_default());
+        Ok(Some(match args.protocol.as_str() {
+            "xmodem" => modem_command("lsz", &format!("-X {remote_path}"), "sx", &remote_path),
+            "xmodem-1k" => modem_command(
+                "lsz",
+                &format!("-X -k {remote_path}"),
+                "sx",
+                &format!("-k {remote_path}"),
+            ),
+            "ymodem" => modem_command(
+                "lsz",
+                &format!("--ymodem {remote_path}"),
+                "sb",
+                &remote_path,
+            ),
+            "zmodem" => modem_command("lsz", &remote_path, "sz", &remote_path),
+            _ => return Err(ToolError::invalid_params("unsupported modem protocol")),
+        }))
+    }
+}
+
+fn modem_command(
+    preferred: &str,
+    preferred_args: &str,
+    _fallback: &str,
+    _fallback_args: &str,
+) -> String {
+    format!("{preferred} {preferred_args}")
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 fn validate_port_string(port: &str) -> Result<(), ToolError> {
     if port.trim().is_empty() {
         Err(ToolError::invalid_params("port must not be empty"))
@@ -756,6 +950,9 @@ fn tool_names() -> &'static [&'static str] {
         "serial_write",
         "serial_read",
         "serial_run_command",
+        "serial_check_modem_tools",
+        "serial_send_file",
+        "serial_receive_file",
         "serial_flush",
         "serial_set_control",
     ]
@@ -897,6 +1094,55 @@ fn tool_definitions() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "serial_check_modem_tools",
+            "description": "Probe the embedded Linux shell for lrz/lsz and compatible rz/sz/rx/sx/rb/sb modem commands. The probe is atomic and returns a boolean map.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "port": {"type": "string", "description": "COM port name; defaults to the active port"},
+                    "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 600000, "default": 10000}
+                },
+                "required": [],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "serial_send_file",
+            "description": "Atomically start a receiver on the embedded target and upload one local file over XMODEM, XMODEM-1K, YMODEM, or ZMODEM. Defaults to ZMODEM and selects lrz before falling back to rz. Set start_command=false only when the target receiver is already waiting.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "port": {"type": "string", "description": "COM port name; defaults to the active port"},
+                    "protocol": {"type": "string", "enum": ["xmodem", "xmodem-1k", "ymodem", "zmodem"], "default": "zmodem"},
+                    "local_path": {"type": "string", "minLength": 1, "description": "Path on the Windows host running serial-mcp"},
+                    "remote_path": {"type": "string", "minLength": 1, "description": "Target filename. Required for automatic XMODEM startup; used as transmitted filename for Y/ZMODEM."},
+                    "command": {"type": "string", "minLength": 1, "description": "Custom target receive command; overrides rx/rb/rz default"},
+                    "start_command": {"type": "boolean", "default": true, "description": "Send a target receive command before starting the protocol"},
+                    "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 600000, "default": 10000, "description": "Timeout for each protocol response"}
+                },
+                "required": ["local_path"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "name": "serial_receive_file",
+            "description": "Atomically start a sender on the embedded target and download one file to the Windows host over XMODEM, XMODEM-1K, YMODEM, or ZMODEM. Defaults to ZMODEM and selects lsz before falling back to sz. Set start_command=false only when the target sender is already running.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "port": {"type": "string", "description": "COM port name; defaults to the active port"},
+                    "protocol": {"type": "string", "enum": ["xmodem", "xmodem-1k", "ymodem", "zmodem"], "default": "zmodem"},
+                    "local_path": {"type": "string", "minLength": 1, "description": "Destination path on the Windows host running serial-mcp"},
+                    "remote_path": {"type": "string", "minLength": 1, "description": "Source path on the embedded target; required for automatic startup"},
+                    "command": {"type": "string", "minLength": 1, "description": "Custom target send command; overrides sx/sb/sz default"},
+                    "start_command": {"type": "boolean", "default": true, "description": "Send a target send command before starting the protocol"},
+                    "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 600000, "default": 10000, "description": "Timeout for each protocol response"}
+                },
+                "required": ["local_path"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
             "name": "serial_flush",
             "description": "Discard pending input and/or output buffers on an open COM port.",
             "inputSchema": {
@@ -1010,6 +1256,9 @@ mod tests {
         assert!(names.contains(&"serial_write"));
         assert!(names.contains(&"serial_read"));
         assert!(names.contains(&"serial_run_command"));
+        assert!(names.contains(&"serial_check_modem_tools"));
+        assert!(names.contains(&"serial_send_file"));
+        assert!(names.contains(&"serial_receive_file"));
     }
 
     #[test]
@@ -1019,5 +1268,62 @@ mod tests {
         assert!(parse_hex("0").is_err());
         assert!(parse_hex("GG").is_err());
         assert!(parse_hex("你好").is_err());
+    }
+
+    #[test]
+    fn transfer_commands_use_protocol_defaults_and_quote_paths() {
+        let args = FileTransferArgs {
+            port: None,
+            protocol: "zmodem".to_string(),
+            local_path: "C:\\firmware.bin".to_string(),
+            remote_path: Some("/tmp/it's.bin".to_string()),
+            command: None,
+            start_command: true,
+            timeout_ms: 10_000,
+        };
+        let receive_command = transfer_command(&args, true).unwrap().unwrap();
+        assert_eq!(receive_command, "lrz -y");
+
+        let send_command = transfer_command(&args, false).unwrap().unwrap();
+        assert_eq!(send_command, "lsz '/tmp/it'\\''s.bin'");
+    }
+
+    #[test]
+    fn modem_tool_check_defaults_and_probe_parser() {
+        let args = ModemToolCheckArgs {
+            port: None,
+            timeout_ms: 10_000,
+        };
+        assert!(validate_modem_tool_check_args(args).is_ok());
+        let tools = crate::serial::parse_modem_tool_probe(b"lrz=1\nlsz=0\nrz=1\n");
+        assert!(tools["lrz"]);
+        assert!(!tools["lsz"]);
+        assert!(tools["rz"]);
+        assert!(!tools["sz"]);
+    }
+
+    #[test]
+    fn receive_transfer_requires_remote_path_only_for_automatic_command() {
+        let missing = FileTransferArgs {
+            port: None,
+            protocol: "zmodem".to_string(),
+            local_path: "firmware.bin".to_string(),
+            remote_path: None,
+            command: None,
+            start_command: true,
+            timeout_ms: 10_000,
+        };
+        assert!(validate_receive_file_args(missing).is_err());
+
+        let manual = FileTransferArgs {
+            port: None,
+            protocol: "zmodem".to_string(),
+            local_path: "firmware.bin".to_string(),
+            remote_path: None,
+            command: None,
+            start_command: false,
+            timeout_ms: 10_000,
+        };
+        assert!(validate_receive_file_args(manual).is_ok());
     }
 }

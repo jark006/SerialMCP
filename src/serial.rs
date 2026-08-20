@@ -4,7 +4,9 @@ use serialport::{
     SerialPortInfo, SerialPortType, StopBits,
 };
 use std::collections::BTreeMap;
-use std::io;
+use std::fs;
+use std::io::{self, Read as IoRead, Write as IoWrite};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 pub const DEFAULT_BAUD_RATE: u32 = 115_200;
@@ -93,6 +95,22 @@ pub struct ControlResult {
     pub dtr: Option<bool>,
     pub rts: Option<bool>,
     pub break_sent_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FileTransferResult {
+    pub port: String,
+    pub protocol: String,
+    pub direction: String,
+    pub local_path: String,
+    pub remote_path: Option<String>,
+    pub bytes_transferred: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ModemToolsResult {
+    pub port: String,
+    pub tools: BTreeMap<String, bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -350,6 +368,237 @@ impl SerialHub {
             port: normalized,
             bytes_written: data.len(),
             encoding: encoding.to_string(),
+        })
+    }
+
+    /// Detect common X/Y/ZMODEM command-line tools on the target shell.
+    pub fn check_modem_tools(
+        &mut self,
+        port: Option<&str>,
+        timeout_ms: u64,
+    ) -> Result<ModemToolsResult, String> {
+        let normalized = self.resolve_port(port)?;
+        let result = {
+            let configured_timeout =
+                Duration::from_millis(self.tracked_mut(&normalized)?.settings.timeout_ms);
+            let handle = self.open_handle_mut(&normalized)?;
+            let result = (|| {
+                handle
+                    .set_timeout(Duration::from_millis(timeout_ms))
+                    .map_err(|error| TransferFailure::Serial(error.to_string()))?;
+                handle
+                    .clear(ClearBuffer::Input)
+                    .map_err(|error| TransferFailure::Serial(error.to_string()))?;
+                let probe = b"for t in lrz lsz rz sz rx sx rb sb; do command -v \"$t\" >/dev/null 2>&1 && printf '%s=1\\n' \"$t\" || printf '%s=0\\n' \"$t\"; done; printf '__SERIAL_MCP_MODEM_DONE__\\n'\n";
+                handle.write_all(probe).map_err(TransferFailure::Io)?;
+                handle.flush().map_err(TransferFailure::Io)?;
+                let collected = collect_from_port(
+                    handle,
+                    Duration::from_millis(timeout_ms),
+                    None,
+                    16_384,
+                    StopCondition::Sequence(b"__SERIAL_MCP_MODEM_DONE__"),
+                )
+                .map_err(|error| match error {
+                    ReadFailure::Serial(error) => TransferFailure::Serial(error.to_string()),
+                    ReadFailure::Io(error) => TransferFailure::Io(error),
+                })?;
+                if !collected.matched {
+                    return Err(TransferFailure::Protocol(
+                        "modem tool probe did not reach its completion marker".to_string(),
+                    ));
+                }
+                handle
+                    .set_timeout(configured_timeout)
+                    .map_err(|error| TransferFailure::Serial(error.to_string()))?;
+                Ok(parse_modem_tool_probe(&collected.bytes))
+            })();
+            if result.is_err() {
+                let _ = handle.set_timeout(configured_timeout);
+            }
+            result
+        };
+        let tools = match result {
+            Ok(tools) => tools,
+            Err(TransferFailure::Serial(error)) => {
+                let message = format!("modem tool detection failed on {normalized}: {error}");
+                return Err(self.record_failure(&normalized, message, false));
+            }
+            Err(TransferFailure::Io(error)) => {
+                let message = format!("modem tool detection failed on {normalized}: {error}");
+                return Err(self.record_io_failure(&normalized, message, &error));
+            }
+            Err(TransferFailure::Message(message) | TransferFailure::Protocol(message)) => {
+                return Err(message);
+            }
+        };
+        self.mark_success(&normalized);
+        Ok(ModemToolsResult {
+            port: normalized,
+            tools,
+        })
+    }
+
+    /// Transfer a local file to the target using XMODEM, YMODEM, or ZMODEM.
+    ///
+    /// The optional command is sent before the protocol starts (for example
+    /// `rz`, `rb`, or a custom boot-loader command). Keeping the command and
+    /// protocol in one operation is important because all serial operations
+    /// are serialized by the MCP server.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_file(
+        &mut self,
+        port: Option<&str>,
+        protocol: &str,
+        local_path: &str,
+        remote_path: Option<&str>,
+        command: Option<&str>,
+        timeout_ms: u64,
+    ) -> Result<FileTransferResult, String> {
+        let normalized = self.resolve_port(port)?;
+        let metadata = fs::metadata(local_path)
+            .map_err(|error| format!("failed to inspect local file {local_path}: {error}"))?;
+        if !metadata.is_file() {
+            return Err(format!("local path is not a file: {local_path}"));
+        }
+        if protocol == "zmodem" && metadata.len() > u64::from(u32::MAX) {
+            return Err("zmodem files must not exceed 4 GiB".to_string());
+        }
+        let bytes = fs::read(local_path)
+            .map_err(|error| format!("failed to read local file {local_path}: {error}"))?;
+        let result = {
+            let configured_timeout =
+                Duration::from_millis(self.tracked_mut(&normalized)?.settings.timeout_ms);
+            let handle = self.open_handle_mut(&normalized)?;
+            let result = (|| {
+                handle
+                    .set_timeout(Duration::from_millis(timeout_ms))
+                    .map_err(|error| TransferFailure::Serial(error.to_string()))?;
+                send_transfer_command(handle, command)?;
+                let transferred = match protocol {
+                    "xmodem" => send_xmodem(handle, &bytes, false)?,
+                    "xmodem-1k" => send_xmodem(handle, &bytes, true)?,
+                    "ymodem" => {
+                        send_ymodem(handle, &bytes, transfer_file_name(local_path, remote_path))?
+                    }
+                    "zmodem" => {
+                        send_zmodem(handle, &bytes, transfer_file_name(local_path, remote_path))?
+                    }
+                    _ => {
+                        return Err(TransferFailure::Message(
+                            "unsupported modem protocol".to_string(),
+                        ));
+                    }
+                };
+                handle
+                    .set_timeout(configured_timeout)
+                    .map_err(|error| TransferFailure::Serial(error.to_string()))?;
+                Ok(transferred)
+            })();
+            if result.is_err() {
+                let _ = handle.set_timeout(configured_timeout);
+            }
+            result
+        };
+        let transferred = match result {
+            Ok(value) => value,
+            Err(TransferFailure::Serial(error)) => {
+                let message = format!("{protocol} upload failed on {normalized}: {error}");
+                return Err(self.record_failure(&normalized, message, false));
+            }
+            Err(TransferFailure::Io(error)) => {
+                let message = format!("{protocol} upload failed on {normalized}: {error}");
+                return Err(self.record_io_failure(&normalized, message, &error));
+            }
+            Err(TransferFailure::Message(message)) => return Err(message),
+            Err(TransferFailure::Protocol(message)) => {
+                let message = format!("{protocol} upload failed on {normalized}: {message}");
+                return Err(self.record_failure(&normalized, message, false));
+            }
+        };
+        self.mark_success(&normalized);
+        Ok(FileTransferResult {
+            port: normalized,
+            protocol: protocol.to_string(),
+            direction: "send".to_string(),
+            local_path: local_path.to_string(),
+            remote_path: remote_path.map(str::to_string),
+            bytes_transferred: transferred,
+        })
+    }
+
+    /// Receive a file from the target and save it to a local path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn receive_file(
+        &mut self,
+        port: Option<&str>,
+        protocol: &str,
+        local_path: &str,
+        remote_path: Option<&str>,
+        command: Option<&str>,
+        timeout_ms: u64,
+    ) -> Result<FileTransferResult, String> {
+        let normalized = self.resolve_port(port)?;
+        validate_receive_path(local_path)?;
+        let result = {
+            let configured_timeout =
+                Duration::from_millis(self.tracked_mut(&normalized)?.settings.timeout_ms);
+            let handle = self.open_handle_mut(&normalized)?;
+            let result = (|| {
+                handle
+                    .set_timeout(Duration::from_millis(timeout_ms))
+                    .map_err(|error| TransferFailure::Serial(error.to_string()))?;
+                send_transfer_command(handle, command)?;
+                let (transferred, data) = match protocol {
+                    "xmodem" => receive_xmodem(handle, false)?,
+                    "xmodem-1k" => receive_xmodem(handle, true)?,
+                    "ymodem" => receive_ymodem(handle)?,
+                    "zmodem" => receive_zmodem(handle)?,
+                    _ => {
+                        return Err(TransferFailure::Message(
+                            "unsupported modem protocol".to_string(),
+                        ));
+                    }
+                };
+                fs::write(local_path, &data).map_err(|error| {
+                    TransferFailure::Message(format!(
+                        "failed to save received file to {local_path}: {error}"
+                    ))
+                })?;
+                handle
+                    .set_timeout(configured_timeout)
+                    .map_err(|error| TransferFailure::Serial(error.to_string()))?;
+                Ok(transferred)
+            })();
+            if result.is_err() {
+                let _ = handle.set_timeout(configured_timeout);
+            }
+            result
+        };
+        let transferred = match result {
+            Ok(value) => value,
+            Err(TransferFailure::Serial(error)) => {
+                let message = format!("{protocol} download failed on {normalized}: {error}");
+                return Err(self.record_failure(&normalized, message, false));
+            }
+            Err(TransferFailure::Io(error)) => {
+                let message = format!("{protocol} download failed on {normalized}: {error}");
+                return Err(self.record_io_failure(&normalized, message, &error));
+            }
+            Err(TransferFailure::Message(message)) => return Err(message),
+            Err(TransferFailure::Protocol(message)) => {
+                let message = format!("{protocol} download failed on {normalized}: {message}");
+                return Err(self.record_failure(&normalized, message, false));
+            }
+        };
+        self.mark_success(&normalized);
+        Ok(FileTransferResult {
+            port: normalized,
+            protocol: protocol.to_string(),
+            direction: "receive".to_string(),
+            local_path: local_path.to_string(),
+            remote_path: remote_path.map(str::to_string),
+            bytes_transferred: transferred,
         })
     }
 
@@ -767,6 +1016,384 @@ impl SerialHub {
             })
             .collect();
         select_reconnect_candidate(&normalized, old_metadata, described)
+    }
+}
+
+fn validate_receive_path(local_path: &str) -> Result<(), String> {
+    let path = Path::new(local_path);
+    if path.file_name().is_none() {
+        return Err(format!("local path must name a file: {local_path}"));
+    }
+    if path.is_dir() {
+        return Err(format!("local path is a directory: {local_path}"));
+    }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.is_dir()
+    {
+        return Err(format!(
+            "local destination directory does not exist: {}",
+            parent.display()
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn parse_modem_tool_probe(data: &[u8]) -> BTreeMap<String, bool> {
+    const TOOL_NAMES: [&str; 8] = ["lrz", "lsz", "rz", "sz", "rx", "sx", "rb", "sb"];
+    let text = String::from_utf8_lossy(data);
+    let mut tools: BTreeMap<String, bool> = TOOL_NAMES
+        .iter()
+        .map(|name| ((*name).to_string(), false))
+        .collect();
+    for line in text.lines() {
+        let Some((name, value)) = line.trim().split_once('=') else {
+            continue;
+        };
+        if let Some(available) = tools.get_mut(name) {
+            *available = value == "1";
+        }
+    }
+    tools
+}
+
+#[derive(Debug)]
+enum TransferFailure {
+    Serial(String),
+    Io(io::Error),
+    Message(String),
+    Protocol(String),
+}
+
+struct SerialIo<'a>(&'a mut dyn SerialPort);
+
+impl IoRead for SerialIo<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        IoRead::read(self.0, buffer)
+    }
+}
+
+impl IoWrite for SerialIo<'_> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        IoWrite::write(self.0, buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        IoWrite::flush(self.0)
+    }
+}
+
+fn send_transfer_command(
+    handle: &mut dyn SerialPort,
+    command: Option<&str>,
+) -> Result<(), TransferFailure> {
+    let Some(command) = command.filter(|value| !value.trim().is_empty()) else {
+        return Ok(());
+    };
+    handle
+        .clear(ClearBuffer::Input)
+        .map_err(|error| TransferFailure::Serial(error.to_string()))?;
+    handle
+        .write_all(command.as_bytes())
+        .map_err(TransferFailure::Io)?;
+    if !command.as_bytes().ends_with(b"\n") && !command.as_bytes().ends_with(b"\r") {
+        handle.write_all(b"\n").map_err(TransferFailure::Io)?;
+    }
+    handle.flush().map_err(TransferFailure::Io)
+}
+
+fn transfer_file_name<'a>(local_path: &'a str, remote_path: Option<&'a str>) -> &'a str {
+    remote_path.unwrap_or_else(|| {
+        Path::new(local_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("payload.bin")
+    })
+}
+
+fn send_xmodem(
+    handle: &mut dyn SerialPort,
+    data: &[u8],
+    one_k: bool,
+) -> Result<usize, TransferFailure> {
+    let mut device = SerialIo(handle);
+    crate::modem::xmodem_send(&mut device, data, one_k).map_err(TransferFailure::Io)
+}
+
+fn receive_xmodem(
+    handle: &mut dyn SerialPort,
+    _one_k: bool,
+) -> Result<(usize, Vec<u8>), TransferFailure> {
+    let mut device = SerialIo(handle);
+    let output = crate::modem::xmodem_receive(&mut device).map_err(TransferFailure::Io)?;
+    Ok((output.len(), output))
+}
+
+fn send_ymodem(
+    handle: &mut dyn SerialPort,
+    data: &[u8],
+    file_name: &str,
+) -> Result<usize, TransferFailure> {
+    let mut device = SerialIo(handle);
+    crate::modem::ymodem_send(&mut device, data, file_name).map_err(TransferFailure::Io)
+}
+
+fn receive_ymodem(handle: &mut dyn SerialPort) -> Result<(usize, Vec<u8>), TransferFailure> {
+    let mut device = SerialIo(handle);
+    let (name, output) = crate::modem::ymodem_receive(&mut device).map_err(TransferFailure::Io)?;
+    if name.is_empty() {
+        return Err(TransferFailure::Protocol(
+            "YMODEM session completed without a file".to_string(),
+        ));
+    }
+    Ok((output.len(), output))
+}
+
+fn send_zmodem(
+    handle: &mut dyn SerialPort,
+    data: &[u8],
+    file_name: &str,
+) -> Result<usize, TransferFailure> {
+    use zmodem2::{FileInfo, Position, Sender};
+
+    let mut sender = Sender::new().map_err(|error| TransferFailure::Protocol(error.to_string()))?;
+    sender
+        .start_file(FileInfo::new(
+            Path::new(file_name)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("payload.bin")
+                .as_bytes(),
+            Some(Position::new(data.len() as u32)),
+        ))
+        .map_err(|error| TransferFailure::Protocol(error.to_string()))?;
+    sender
+        .finish()
+        .map_err(|error| TransferFailure::Protocol(error.to_string()))?;
+    drive_zmodem_sender(&mut SerialIo(handle), &mut sender, data)
+}
+
+fn drive_zmodem_sender<D: IoRead + IoWrite>(
+    handle: &mut D,
+    sender: &mut zmodem2::Sender,
+    data: &[u8],
+) -> Result<usize, TransferFailure> {
+    use zmodem2::{Action, Event};
+    let deadline = Instant::now() + Duration::from_secs(24 * 60 * 60);
+    let mut incoming = Vec::new();
+    let mut idle_timeouts = 0usize;
+    let mut session_completed = false;
+    loop {
+        if Instant::now() >= deadline {
+            sender.abort();
+            return Err(TransferFailure::Protocol("transfer timed out".to_string()));
+        }
+        match sender.poll() {
+            Action::WriteWire(bytes) => {
+                let payload = bytes.to_vec();
+                handle.write_all(&payload).map_err(TransferFailure::Io)?;
+                handle.flush().map_err(TransferFailure::Io)?;
+                sender.wire_written(payload.len());
+            }
+            Action::ReadFile { offset, max_len } => {
+                let start = offset.get() as usize;
+                let end = start.saturating_add(max_len).min(data.len());
+                if end <= start {
+                    return Err(TransferFailure::Protocol(
+                        "sender requested data past EOF".to_string(),
+                    ));
+                }
+                sender
+                    .submit_file(&data[start..end])
+                    .map_err(|error| TransferFailure::Protocol(error.to_string()))?;
+            }
+            Action::Event(Event::SessionCompleted) => session_completed = true,
+            Action::Event(Event::Aborted) => {
+                return Err(TransferFailure::Protocol(
+                    "peer aborted transfer".to_string(),
+                ));
+            }
+            Action::Event(_) => {}
+            Action::Idle => {
+                if session_completed {
+                    return Ok(data.len());
+                }
+                if incoming.is_empty() {
+                    let mut buffer = [0u8; 4096];
+                    match handle.read(&mut buffer) {
+                        Ok(0) => {
+                            idle_timeouts += 1;
+                            if idle_timeouts >= 16 {
+                                sender.abort();
+                                return Err(TransferFailure::Protocol(
+                                    "protocol response retry limit exceeded".to_string(),
+                                ));
+                            }
+                            sender
+                                .timeout()
+                                .map_err(|error| TransferFailure::Protocol(error.to_string()))?;
+                        }
+                        Ok(count) => {
+                            idle_timeouts = 0;
+                            incoming.extend_from_slice(&buffer[..count]);
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+                            idle_timeouts += 1;
+                            if idle_timeouts >= 16 {
+                                sender.abort();
+                                return Err(TransferFailure::Protocol(
+                                    "protocol response retry limit exceeded".to_string(),
+                                ));
+                            }
+                            sender
+                                .timeout()
+                                .map_err(|error| TransferFailure::Protocol(error.to_string()))?
+                        }
+                        Err(error) => return Err(TransferFailure::Io(error)),
+                    }
+                }
+                if !incoming.is_empty() {
+                    let consumed = sender
+                        .submit_wire(&incoming)
+                        .map_err(|error| TransferFailure::Protocol(error.to_string()))?;
+                    incoming.drain(..consumed);
+                    if consumed > 0 {
+                        idle_timeouts = 0;
+                    }
+                }
+            }
+            _ => {
+                return Err(TransferFailure::Protocol(
+                    "unsupported ZMODEM sender action".to_string(),
+                ));
+            }
+        }
+    }
+}
+
+fn receive_zmodem(handle: &mut dyn SerialPort) -> Result<(usize, Vec<u8>), TransferFailure> {
+    drive_zmodem_receiver(&mut SerialIo(handle))
+}
+
+fn drive_zmodem_receiver<D: IoRead + IoWrite>(
+    handle: &mut D,
+) -> Result<(usize, Vec<u8>), TransferFailure> {
+    use zmodem2::{Action, Event, Receiver};
+    let mut receiver = Receiver::with_flow_control(0, true)
+        .map_err(|error| TransferFailure::Protocol(error.to_string()))?;
+    let mut output = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(24 * 60 * 60);
+    let mut incoming = Vec::new();
+    let mut idle_timeouts = 0usize;
+    let mut files_started = 0usize;
+    let mut expected_size = None;
+    let mut session_completed = false;
+    loop {
+        if Instant::now() >= deadline {
+            let _ = receiver.abort();
+            return Err(TransferFailure::Protocol("transfer timed out".to_string()));
+        }
+        match receiver.poll() {
+            Action::WriteWire(bytes) => {
+                let payload = bytes.to_vec();
+                handle.write_all(&payload).map_err(TransferFailure::Io)?;
+                handle.flush().map_err(TransferFailure::Io)?;
+                receiver.wire_written(payload.len());
+            }
+            Action::WriteFile(bytes) => {
+                output.extend_from_slice(bytes);
+                let count = bytes.len();
+                receiver
+                    .file_written(count)
+                    .map_err(|error| TransferFailure::Protocol(error.to_string()))?;
+            }
+            Action::Event(Event::FileStarted(info)) => {
+                files_started += 1;
+                if files_started > 1 {
+                    let _ = receiver.abort();
+                    return Err(TransferFailure::Protocol(
+                        "multiple files are not supported by serial_receive_file".to_string(),
+                    ));
+                }
+                expected_size = info.size.map(|size| size.get() as usize);
+            }
+            Action::Event(Event::FileCompleted) => {
+                if let Some(size) = expected_size
+                    && size != output.len()
+                {
+                    return Err(TransferFailure::Protocol(format!(
+                        "received {} bytes but peer advertised {size}",
+                        output.len()
+                    )));
+                }
+            }
+            Action::Event(Event::SessionCompleted) => {
+                if files_started != 1 {
+                    return Err(TransferFailure::Protocol(
+                        "ZMODEM session completed without a file".to_string(),
+                    ));
+                }
+                session_completed = true;
+            }
+            Action::Event(Event::Aborted) => {
+                return Err(TransferFailure::Protocol(
+                    "peer aborted transfer".to_string(),
+                ));
+            }
+            Action::Idle => {
+                if session_completed {
+                    return Ok((output.len(), output));
+                }
+                if incoming.is_empty() {
+                    let mut buffer = [0u8; 4096];
+                    match handle.read(&mut buffer) {
+                        Ok(0) => {
+                            idle_timeouts += 1;
+                            if idle_timeouts >= 16 {
+                                let _ = receiver.abort();
+                                return Err(TransferFailure::Protocol(
+                                    "protocol response retry limit exceeded".to_string(),
+                                ));
+                            }
+                            receiver
+                                .timeout()
+                                .map_err(|error| TransferFailure::Protocol(error.to_string()))?;
+                        }
+                        Ok(count) => {
+                            idle_timeouts = 0;
+                            incoming.extend_from_slice(&buffer[..count]);
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+                            idle_timeouts += 1;
+                            if idle_timeouts >= 16 {
+                                let _ = receiver.abort();
+                                return Err(TransferFailure::Protocol(
+                                    "protocol response retry limit exceeded".to_string(),
+                                ));
+                            }
+                            receiver
+                                .timeout()
+                                .map_err(|error| TransferFailure::Protocol(error.to_string()))?;
+                        }
+                        Err(error) => return Err(TransferFailure::Io(error)),
+                    }
+                }
+                if !incoming.is_empty() {
+                    let consumed = receiver
+                        .submit_wire(&incoming)
+                        .map_err(|error| TransferFailure::Protocol(error.to_string()))?;
+                    incoming.drain(..consumed);
+                    if consumed > 0 {
+                        idle_timeouts = 0;
+                    }
+                }
+            }
+            _ => {
+                return Err(TransferFailure::Protocol(
+                    "unsupported ZMODEM receiver action".to_string(),
+                ));
+            }
+        }
     }
 }
 
@@ -1229,6 +1856,7 @@ fn parse_flow_control(value: &str) -> Result<FlowControl, String> {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 
     #[test]
     fn hub_starts_without_active_port() {
@@ -1327,6 +1955,100 @@ mod tests {
         let raw = b"\x1b[32mroot\x1b[0m@board:~# \x1b]0;title\x07";
         assert_eq!(strip_ansi_bytes(raw), b"root@board:~# ");
         assert_eq!(strip_ansi_bytes(b"ab\x08c"), b"ac");
+    }
+
+    struct ChannelDevice {
+        incoming: Receiver<Vec<u8>>,
+        pending: VecDeque<u8>,
+        outgoing: Sender<Vec<u8>>,
+    }
+
+    impl IoRead for ChannelDevice {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.pending.is_empty() {
+                match self.incoming.recv_timeout(Duration::from_millis(100)) {
+                    Ok(bytes) => self.pending.extend(bytes),
+                    Err(RecvTimeoutError::Timeout) => {
+                        return Err(io::Error::from(io::ErrorKind::TimedOut));
+                    }
+                    Err(RecvTimeoutError::Disconnected) => {
+                        return Err(io::Error::from(io::ErrorKind::BrokenPipe));
+                    }
+                }
+            }
+            let count = buffer.len().min(self.pending.len());
+            for slot in &mut buffer[..count] {
+                *slot = self.pending.pop_front().unwrap();
+            }
+            Ok(count)
+        }
+    }
+
+    impl IoWrite for ChannelDevice {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.outgoing
+                .send(buffer.to_vec())
+                .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn channel_pair() -> (ChannelDevice, ChannelDevice) {
+        let (a_tx, a_rx) = mpsc::channel();
+        let (b_tx, b_rx) = mpsc::channel();
+        (
+            ChannelDevice {
+                incoming: a_rx,
+                pending: VecDeque::new(),
+                outgoing: b_tx,
+            },
+            ChannelDevice {
+                incoming: b_rx,
+                pending: VecDeque::new(),
+                outgoing: a_tx,
+            },
+        )
+    }
+
+    #[test]
+    fn zmodem_round_trip_over_duplex_stream() {
+        use zmodem2::{FileInfo, Position, Sender as ZSender};
+        let data = (0..65_537)
+            .map(|value| (value * 31) as u8)
+            .collect::<Vec<_>>();
+        let (mut sender_device, mut receiver_device) = channel_pair();
+        let (release_tx, release_rx) = mpsc::channel();
+        let receiver = std::thread::spawn(move || {
+            let result = drive_zmodem_receiver(&mut receiver_device);
+            let _ = release_rx.recv();
+            result
+        });
+        let mut sender = ZSender::new().unwrap();
+        sender
+            .start_file(FileInfo::new(
+                b"firmware.bin",
+                Some(Position::new(data.len() as u32)),
+            ))
+            .unwrap();
+        sender.finish().unwrap();
+
+        let sent = drive_zmodem_sender(&mut sender_device, &mut sender, &data);
+        let _ = release_tx.send(());
+        let received_result = receiver.join().unwrap();
+        assert!(sent.is_ok(), "sender failed: {sent:?}");
+        assert!(
+            received_result.is_ok(),
+            "receiver failed: {:?}",
+            received_result.as_ref().err()
+        );
+        assert_eq!(sent.unwrap(), data.len());
+        let (count, received) = received_result.unwrap();
+        assert_eq!(count, data.len());
+        assert_eq!(received, data);
     }
 
     fn collect_chunks<'a>(

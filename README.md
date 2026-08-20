@@ -63,6 +63,9 @@ Claude Code：
 | `serial_close` | 关闭并遗忘打开、故障或断开的串口记录。 |
 | `serial_configure` | 修改一个或多个串口参数；至少需要提供一个参数。 |
 | `serial_run_command` | 原子化发送终端命令并收集响应，推荐用于嵌入式 Linux Shell。 |
+| `serial_check_modem_tools` | 在开发板 shell 中检测 `lrz`、`lsz` 及 `rz/sz/rx/sx/rb/sb` 兼容命令。 |
+| `serial_send_file` | 通过 XMODEM、XMODEM-1K、YMODEM 或 ZMODEM 将 Windows 本地文件发送到开发板。 |
+| `serial_receive_file` | 通过 XMODEM、XMODEM-1K、YMODEM 或 ZMODEM 将开发板文件保存到 Windows 本地。 |
 | `serial_write` | 写入文本或 hex 字节，可追加 `none`、`lf`、`cr` 或 `crlf` 行结束符。 |
 | `serial_read` | 按整体超时、行结束符、精确序列或字节上限读取文本/hex 数据。 |
 | `serial_flush` | 清空输入、输出或全部驱动缓冲区。 |
@@ -87,6 +90,39 @@ Claude Code：
 {"name":"serial_run_command","arguments":{"command":"dmesg | tail -20","idle_timeout_ms":500}}
 ```
 
+### X/Y/ZMODEM 文件传输
+
+`serial_send_file` 和 `serial_receive_file` 会在同一次原子串口操作中启动开发板端程序并完成整个协议会话。不要先用 `serial_run_command` 单独运行 `rz` 或 `sz`：该命令会等待协议数据，并阻塞后续串口请求。
+
+可先调用 `serial_check_modem_tools` 检测开发板是否安装了 `lrz/lsz`。检测命令通过 `command -v` 完成，返回每个命令的布尔值；`lrz/lsz` 通常是 `rz/sz` 的增强版或别名。文件传输默认使用 `lrz/lsz`；如果检测结果显示不存在，请通过 `command` 参数显式指定目标上的 `rz/sz/rx/sx/rb/sb` 兼容命令。
+
+默认协议是 `zmodem`，也可以选择 `xmodem`、`xmodem-1k` 或 `ymodem`。默认启动命令如下：
+
+| 协议 | Windows → 开发板 | 开发板 → Windows |
+| --- | --- | --- |
+| XMODEM | `lrz -X -c -y` / `rx` | `lsz -X` / `sx` |
+| XMODEM-1K | `lrz -X -c -y` / `rx` | `lsz -X -k` / `sx -k` |
+| YMODEM | `lrz --ymodem -y` / `rb` | `lsz --ymodem` / `sb` |
+| ZMODEM | `lrz -y` / `rz -y` | `lsz` / `sz` |
+
+路径含义：
+
+- `local_path` 始终是运行 `serial-mcp.exe` 的 Windows 主机路径，不是 MCP 客户端所在机器的路径。
+- 发送时，`remote_path` 是目标文件名；XMODEM 自动启动时必须提供。Y/ZMODEM 省略它会使用 `local_path` 的文件名。
+- 接收并自动启动远端命令时必须提供 `remote_path`。
+- 可通过 `command` 覆盖默认命令，例如 `cd /tmp && rz -y`。如果开发板端程序已经在等待协议握手，设置 `start_command: false`；此时不会清空现有输入，以保留握手字节。
+- `timeout_ms` 是每次协议响应的等待时间，默认 `10000`。连续 16 次超时后传输会取消。
+
+示例：
+
+```json
+{"name":"serial_send_file","arguments":{"local_path":"C:\\build\\firmware.bin","remote_path":"firmware.bin"}}
+{"name":"serial_receive_file","arguments":{"remote_path":"/tmp/log.tar.gz","local_path":"C:\\logs\\log.tar.gz","protocol":"zmodem"}}
+{"name":"serial_send_file","arguments":{"local_path":"C:\\build\\u-boot.bin","remote_path":"u-boot.bin","protocol":"xmodem-1k","command":"loadx"}}
+```
+
+YMODEM 和 ZMODEM 会传输文件大小，因此接收结果与源文件精确等长。XMODEM 协议没有文件大小元数据，接收文件会保留最后一个 128/1024 字节块中的 `0x1A` 填充；若目标命令另有长度信息，应在传输后按已知长度截取。工具使用 CRC、块序号校验和 NAK 重传；传输失败时不会自动重放整个文件。
+
 ### 底层读取
 
 `serial_read` 返回 `data`、`hex`、`bytes_read`、`stop_reason`、`matched` 和 `timed_out`。`stop_reason` 为 `timeout`、`idle`、`line`、`sequence` 或 `max_bytes` 之一。
@@ -110,7 +146,7 @@ Claude Code：
 
 设备断开时会保留活动端口选择和串口参数，因此重新插入后可以直接调用 `serial_reconnect`。重连会优先通过 USB 序列号以及 VID/PID 确认设备，并在序列号唯一时跟随新的 COM 号。如果原 COM 号被另一设备占用，默认拒绝连接。任何可能已经部分发送的命令或字节都不会被自动重放。
 
-所有串口操作通过同一个共享状态串行执行。长时间读取会暂时阻塞其他串口请求，因此应根据命令预期设置合理的 `timeout_ms`。
+所有串口操作通过同一个共享状态串行执行。长时间读取或文件传输会暂时阻塞其他串口请求，因此应根据命令和文件大小设置合理的 `timeout_ms`。
 
 ## 默认串口参数
 
@@ -123,7 +159,7 @@ Claude Code：
 
 ## 构建与验证
 
-项目使用 Rust 2024、Axum、Tokio、Serde 和 `serialport`。`.cargo/config.toml` 启用了 MSVC 静态 CRT；release 配置启用 LTO、单 codegen unit 和体积优化。
+项目使用 Rust 2024、Axum、Tokio、Serde、`serialport` 和 `zmodem2`；X/YMODEM 协议核心由项目内实现。`.cargo/config.toml` 启用了 MSVC 静态 CRT；release 配置启用 LTO、单 codegen unit 和体积优化。
 
 ```powershell
 cargo fmt --all -- --check
