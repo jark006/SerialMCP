@@ -1,67 +1,45 @@
-# AGENTS.md
+# 编码代理约定
 
-本文件为后续在此仓库工作的编码代理提供项目上下文与协作约定。请先阅读 `README.md`，那里有面向用户的完整使用说明。
+优先使用简体中文沟通。项目是 Windows x64 UART MCP 服务，同时支持终端和原始字节设备。优先保证目标明确、执行状态可信、数据不静默丢失、反馈精简可追索。避免无关依赖和为拆分而拆分的重构。
 
-## 项目概览
+## 阅读入口
 
-- `serial-mcp` 是一个 Windows x64 串口 MCP Streamable HTTP 服务，供 Codex/Claude Code 等客户端调用，用于操作嵌入式开发板的 UART 调试串口。
-- 技术栈：Rust 2024，依赖 `axum`、`tokio`、`serde`、`serde_json`、`serialport`、`zmodem2`。
-- 进程默认监听 `127.0.0.1:8765`，通过 `POST /mcp` 接收 JSON-RPC 请求；诊断日志只能写 stderr。
-- 目标平台为 Windows；`.cargo/config.toml` 已启用 `crt-static`，release 产物不依赖 `VCRUNTIME140.dll`。
+先读 [README](README.md) 理解用户安装与使用，再按任务选择：
 
-## 常用命令
+| 任务 | 文档 |
+| --- | --- |
+| 使用串口工具、核对对外行为 | [Agent 指南](docs/agent-guide.md)、[工具手册](docs/tools.md) |
+| 定位模块、修改服务实现 | [开发指南](docs/development.md)、[实现与协议](docs/architecture.md) |
+| 选择验证方法、复现实机问题 | [测试与验收](docs/testing.md)、[Linux 实机验收](docs/testing-linux.md) |
+| 修改默认值、响应或兼容行为 | [升级说明](docs/migration.md) |
 
-在仓库根目录执行：
+根目录存在 `.codegraph/` 时，理解或定位代码前优先使用 CodeGraph；否则使用 `rg`，不要自行索引。
+
+## 必须保持的行为
+
+- 同端口操作独占，冲突立即 busy，不排队写入；注册表锁内不得阻塞 I/O，不同端口可独立工作。
+- 写入或文件传输失败不重试整个操作，部分写入的结果不确定；协议规定的当前数据包重传可以保留。
+- terminal/binary 是交互配置，不是系统识别；binary 默认 hex，不注入隐式 Shell。
+- 匹配后的字节留给后续读取和手动文件协议；只有显式清输入或连接重置才丢弃。
+- 提示符和静默不能证明 Shell 完成；exec 只有解析到专属标记和退出码才报告 completed。内部求值与标记绕过同名函数/别名，辅助 Shell 查找不依赖用户 PATH，且不能修改命令看到的 PATH。
+- exec 长短命令默认 stdin 均为 EOF；文件启动命令必须保留原始串口 stdin。取消本地读取不等于停止远端程序。
+- compact 只输出一份结果，展示量与接收量分离；截断可见，分页不得跳过未展示数据。
+- 参数错误为 JSON-RPC -32602；设备/文件失败为 isError=true；错误使用英文；structuredContent 必须是对象。
+- 诊断写 stderr，默认回环、拒绝浏览器 Origin，不隐藏无认证和客户端共享连接的事实。
+
+## 修改与验证
+
+修改工具时同步检查分发、参数校验、`src/mcp/schema.rs`、行为测试及用户手册；默认值和响应结构变化写入升级说明。测试应覆盖外部可观察行为及真实失败模式，避免仅复述实现。
+
+Rust 代码变更完成后执行：
 
 ```powershell
 cargo fmt --all -- --check
-cargo test
-cargo clippy --all-targets -- -D warnings
-cargo build --release
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
+cargo build --locked --release
 ```
 
-- 发布产物：`target\release\serial-mcp.exe`
-- 提交前至少保证 `cargo fmt --check` 与 `cargo test` 通过。
+可选 POSIX Shell 测试、运行中 exe 的独立构建方法见开发和测试文档。默认测试不得触碰真实端口；只有用户明确提供测试设备后才运行对应硬件脚本。回环不能证明真实 Shell 或对端文件传输完成。
 
-## 代码结构
-
-- `src/main.rs`
-  - 程序入口：解析 `--help`/`-h` 和 `--bind`，启动 Tokio/Axum HTTP 服务。
-  - 默认只绑定回环地址；非回环绑定会输出无身份验证警告。
-- `src/http_transport.rs`
-  - MCP Streamable HTTP 传输层：处理 `POST /mcp`、HTTP 请求头校验和 JSON-RPC 解析错误。
-  - 串口操作通过 blocking task 串行访问共享 `SerialHub`；通知返回 `202`，`GET /mcp` 返回 `405`。
-- `src/mcp.rs`
-  - MCP/JSON-RPC 协议层：`handle_message` 分发 `initialize`、`ping`、`tools/list`、`tools/call` 等消息。
-  - 定义全部 MCP 工具的参数结构、默认值、输入校验和 `inputSchema`。
-  - 包含协议层单元测试，例如初始化响应、通知无响应、工具列表、hex 解析。
-- `src/modem.rs`
-  - XMODEM/XMODEM-1K 与 YMODEM 协议核心，包含 CRC、块序号、NAK 重传、取消和批结束处理。
-  - 通过内存双工流测试发送端与接收端的完整协议会话。
-- `src/serial.rs`
-  - 串口业务层：`SerialHub` 管理打开端口、活动端口和串口参数。
-  - 文件传输以“启动远端命令 + 完整协议会话”的原子操作执行；ZMODEM 由 `zmodem2` 状态机驱动。
-  - 包含纯函数与参数解析单元测试，例如端口规范化、VID/PID 格式化、串口参数解析。
-  - 真实串口硬件操作无法在单测中覆盖，只测试可脱离硬件验证的逻辑。
-
-## 关键约定
-
-- 默认串口参数定义在 `src/serial.rs`：
-  - `baud_rate: 115200`、`data_bits: 8`、`stop_bits: 1`、`parity: "none"`、`flow_control: "none"`、`timeout_ms: 1000`。
-- 端口名通过 `normalize_port` 做 `trim` + 大写；例如 `" com3 "` 归一化为 `"COM3"`。
-- 多数工具的 `port` 可省略，省略时使用 `SerialHub.active`（最近成功打开的端口）。
-- MCP 参数校验在 `mcp.rs`：
-  - 非法参数返回 JSON-RPC `-32602 invalid params`。
-  - 合法参数但硬件操作失败时，`tools/call` 返回 `isError: true` 的工具结果。
-- 编码只支持 `text` 与 `hex`；`serial_write` 的 hex 输入可含空格和可选 `0x` 前缀。
-- `serial_read` 同时返回 `data`（按 encoding 解码）和 `hex`（大写十六进制、空格分隔）。
-
-## 修改时的检查清单
-
-- 新增 MCP 工具时，同步更新：
-  - `mcp.rs` 中的 `tool_names` 与 `tool_definitions`。
-  - `call_tool` 分发逻辑、参数结构体与校验函数。
-  - 相应单元测试和 `README.md` 的工具表。
-- 修改默认值或参数范围时，保持 `mcp.rs` 的校验逻辑、`serial.rs` 的常量和 `inputSchema` 一致。
-- 保持现有错误信息为英文；面向用户的中文说明放在 `README.md` 或最终回复中。
-- 本仓库偏好最小化、聚焦的变更，不引入无关重构或额外依赖。
+文档变更校验本地链接、JSON 工具示例与当前 Schema；新增或迁移文档后，检查发布包内文档及链接是否齐全。README 保留安装和操作入口，当前工具行为放工具手册，技术实现放架构文档，测试方法与验收结果分开记录，历史过程归档到 `docs/history/`。
