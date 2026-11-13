@@ -1,8 +1,8 @@
 [package]
 name = "serial-mcp"
-version = "0.3.0"
+version = "0.4.9"
 edition = "2024"
-description = "Windows x64 serial-port MCP Streamable HTTP server for embedded UART consoles"
+description = "Agent-oriented UART MCP server for terminal sessions and binary devices on Windows"
 license = "MIT"
 
 [dependencies]

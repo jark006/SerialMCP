@@ -1,4 +1,4 @@
-use crate::{mcp, serial::SerialHub};
+use crate::{mcp, service::SerialService};
 use axum::{
     Json, Router,
     body::Bytes,
@@ -8,19 +8,19 @@ use axum::{
     routing::post,
 };
 use serde_json::{Value, json};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 pub const MCP_ENDPOINT: &str = "/mcp";
 const PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
 
 #[derive(Clone)]
 struct AppState {
-    hub: Arc<Mutex<SerialHub>>,
+    service: Arc<SerialService>,
 }
 
 pub fn router() -> Router {
     let state = AppState {
-        hub: Arc::new(Mutex::new(SerialHub::new())),
+        service: Arc::new(SerialService::default()),
     };
     Router::new()
         .route(MCP_ENDPOINT, post(handle_post))
@@ -67,14 +67,8 @@ async fn handle_post(State(state): State<AppState>, headers: HeaderMap, body: By
     }
 
     let response_id = message.get("id").cloned().unwrap_or(Value::Null);
-    let result = tokio::task::spawn_blocking(move || {
-        let mut hub = state
-            .hub
-            .lock()
-            .map_err(|_| "serial hub lock poisoned".to_string())?;
-        Ok::<_, String>(mcp::handle_message(message, &mut hub))
-    })
-    .await;
+    let result =
+        tokio::task::spawn_blocking(move || Ok::<_, String>(state.service.handle(message))).await;
 
     match result {
         Ok(Ok(Some(response))) => Json(response).into_response(),

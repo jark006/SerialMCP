@@ -1,7 +1,11 @@
 mod http_transport;
 mod mcp;
 mod modem;
+mod output;
+mod reader;
 mod serial;
+mod service;
+mod terminal;
 
 use std::{net::SocketAddr, process::ExitCode};
 
@@ -19,9 +23,16 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> Result<(), String> {
-    let Some(bind_address) = parse_args(std::env::args().skip(1))? else {
-        println!("{}", help_text());
-        return Ok(());
+    let bind_address = match parse_args(std::env::args().skip(1))? {
+        Command::Serve(address) => address,
+        Command::Help => {
+            println!("{}", help_text());
+            return Ok(());
+        }
+        Command::Version => {
+            println!("serial-mcp {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
     };
     let listener = tokio::net::TcpListener::bind(bind_address)
         .await
@@ -43,14 +54,22 @@ async fn run() -> Result<(), String> {
         .map_err(|error| format!("HTTP server failed: {error}"))
 }
 
-fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<SocketAddr>, String> {
+#[derive(Debug, PartialEq, Eq)]
+enum Command {
+    Serve(SocketAddr),
+    Help,
+    Version,
+}
+
+fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command, String> {
     let mut args = args.into_iter();
     let mut bind_address = DEFAULT_BIND_ADDRESS.to_string();
     let mut bind_was_set = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--help" | "-h" => return Ok(None),
+            "--help" | "-h" => return Ok(Command::Help),
+            "--version" | "-V" => return Ok(Command::Version),
             "--bind" => {
                 if bind_was_set {
                     return Err("--bind may only be specified once".to_string());
@@ -66,16 +85,17 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Option<SocketAdd
 
     bind_address
         .parse()
-        .map(Some)
+        .map(Command::Serve)
         .map_err(|error| format!("invalid --bind address '{bind_address}': {error}"))
 }
 
 fn help_text() -> &'static str {
-    "serial-mcp: Windows x64 MCP Streamable HTTP server for serial/UART consoles.\n\
+    "serial-mcp: Agent UART tools for terminal and binary devices on Windows x64.\n\
      Usage: serial-mcp.exe [--bind <IP:PORT>]\n\n\
      Options:\n\
        --bind <IP:PORT>  Listen address (default: 127.0.0.1:8765)\n\
        -h, --help        Show this help\n\n\
+       -V, --version     Show version\n\n\
      MCP endpoint: http://127.0.0.1:8765/mcp"
 }
 
@@ -91,16 +111,14 @@ mod tests {
 
     #[test]
     fn default_bind_address_is_loopback() {
-        let address = parse_args(Vec::<String>::new()).unwrap().unwrap();
-        assert_eq!(address, "127.0.0.1:8765".parse().unwrap());
+        let address = parse_args(Vec::<String>::new()).unwrap();
+        assert_eq!(address, Command::Serve("127.0.0.1:8765".parse().unwrap()));
     }
 
     #[test]
     fn bind_argument_is_parsed() {
-        let address = parse_args(["--bind".to_string(), "127.0.0.1:9000".to_string()])
-            .unwrap()
-            .unwrap();
-        assert_eq!(address, "127.0.0.1:9000".parse().unwrap());
+        let address = parse_args(["--bind".to_string(), "127.0.0.1:9000".to_string()]).unwrap();
+        assert_eq!(address, Command::Serve("127.0.0.1:9000".parse().unwrap()));
     }
 
     #[test]

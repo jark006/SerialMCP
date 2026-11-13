@@ -457,7 +457,7 @@ dependencies = [
 
 [[package]]
 name = "serial-mcp"
-version = "0.3.0"
+version = "0.4.9"
 dependencies = [
  "axum",
  "serde",

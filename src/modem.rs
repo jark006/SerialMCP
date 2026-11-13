@@ -10,6 +10,7 @@ const CRC_REQUEST: u8 = b'C';
 const PAD: u8 = 0x1A;
 const MAX_RETRIES: usize = 16;
 const MAX_GARBAGE_BYTES: usize = 4096;
+pub const MAX_FILE_BYTES: usize = 64 * 1024 * 1024;
 
 pub fn xmodem_send<D: Read + Write>(device: &mut D, data: &[u8], one_k: bool) -> io::Result<usize> {
     let crc = wait_for_start(device, true)?;
@@ -52,6 +53,10 @@ pub fn ymodem_receive<D: Read + Write>(device: &mut D) -> io::Result<(String, Ve
 
     let header = receive_expected_packet(device, 0, true)?;
     let (name, size) = parse_ymodem_header(&header)?;
+    if size > MAX_FILE_BYTES {
+        cancel(device)?;
+        return Err(invalid_data("file exceeds the 64 MiB transfer limit"));
+    }
     if name.is_empty() {
         device.write_all(&[ACK])?;
         device.flush()?;
@@ -142,6 +147,12 @@ fn receive_xmodem_blocks<D: Read + Write>(
                             .map(|size| size.saturating_sub(output.len()))
                             .unwrap_or(payload.len())
                             .min(payload.len());
+                        if wanted == 0 || output.len().saturating_add(wanted) > MAX_FILE_BYTES {
+                            cancel(device)?;
+                            return Err(invalid_data(
+                                "modem data exceeds the expected size or 64 MiB transfer limit",
+                            ));
+                        }
                         output.extend_from_slice(&payload[..wanted]);
                         expected_sequence = expected_sequence.wrapping_add(1);
                         errors = 0;
@@ -686,6 +697,39 @@ mod tests {
         let parsed = parse_ymodem_header(&header).unwrap();
         assert_eq!(parsed, ("firmware.bin".to_string(), 4096));
         assert!(header.windows(4).any(|window| window == b"4096"));
+    }
+
+    #[test]
+    fn ymodem_rejects_oversized_advertisement_before_receiving_data() {
+        use std::io::Cursor;
+        struct Device {
+            input: Cursor<Vec<u8>>,
+            output: Vec<u8>,
+        }
+        impl Read for Device {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                self.input.read(bytes)
+            }
+        }
+        impl Write for Device {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.output.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let header = ymodem_header("large.bin", MAX_FILE_BYTES + 1).unwrap();
+        let mut device = Device {
+            input: Cursor::new(packet(0, &header, true)),
+            output: Vec::new(),
+        };
+        assert_eq!(
+            ymodem_receive(&mut device).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(device.output.contains(&CAN));
     }
 
     #[test]

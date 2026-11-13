@@ -1,7 +1,13 @@
+mod schema;
 use crate::serial::{
     DEFAULT_BAUD_RATE, DEFAULT_DATA_BITS, DEFAULT_FLOW_CONTROL, DEFAULT_PARITY, DEFAULT_STOP_BITS,
-    DEFAULT_TIMEOUT_MS, PartialSettings, PortSettings, SerialHub,
+    DEFAULT_TIMEOUT_MS, PartialSettings, PortSettings, Profile, SerialHub,
 };
+use crate::{
+    output::{self, ResponseMode},
+    terminal::{self, ShellCommand},
+};
+use schema::tool_definitions;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -10,9 +16,9 @@ pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-03-26", MCP_PROTOCOL_VE
 pub const SERVER_NAME: &str = "serial-mcp";
 
 #[derive(Debug)]
-struct ToolError {
+pub(crate) struct ToolError {
     kind: String,
-    message: String,
+    pub(crate) message: String,
 }
 
 impl ToolError {
@@ -33,9 +39,10 @@ impl ToolError {
 
 pub fn handle_message(message: Value, hub: &mut SerialHub) -> Option<Value> {
     let id = message.get("id").cloned();
-    if message.get("jsonrpc") != Some(&Value::String("2.0".to_string())) {
+    if !valid_request(&message) {
         return Some(rpc_error(
-            id.unwrap_or(Value::Null),
+            id.filter(|id| id.is_null() || id.is_string() || id.is_number())
+                .unwrap_or(Value::Null),
             -32600,
             "invalid JSON-RPC request",
         ));
@@ -92,7 +99,7 @@ fn initialize(id: Option<Value>, params: Option<&Value>) -> Option<Value> {
             "protocolVersion": protocol_version,
             "capabilities": {"tools": {}},
             "serverInfo": {"name": SERVER_NAME, "version": env!("CARGO_PKG_VERSION")},
-            "instructions": "Serial console for embedded Linux on Windows. Recommended workflow: serial_list_ports, serial_open, then serial_check_modem_tools or serial_send_file/serial_receive_file for atomic X/Y/ZMODEM transfers. After USB hot-plug, call serial_status and serial_reconnect. Use serial_read/serial_write for raw byte-level interaction."
+            "instructions": "UART tools on Windows: list ports, open with profile=terminal for Linux/login/bootloader or profile=binary for MCU frames. Use serial_exec for POSIX shell exit codes, serial_run_command for prompts/login, serial_exchange for atomic byte requests, serial_send_key for Ctrl+C/arrows. Responses are compact by default; response_mode=detailed adds raw data. Long output is retained for serial_get_output. Ports operate independently; the same busy port fails immediately. serial_cancel stops an active read but does not interrupt the remote program. Never retry writes automatically after errors. All clients share ports and active selection; specify port with multiple boards."
         }),
     ))
 }
@@ -104,7 +111,7 @@ fn call_tool(id: Value, params: Option<&Value>, hub: &mut SerialHub) -> Value {
     let Some(name) = params.get("name").and_then(Value::as_str) else {
         return rpc_error(id, -32602, "tool name must be a string");
     };
-    let arguments = params
+    let mut arguments = params
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
@@ -115,7 +122,163 @@ fn call_tool(id: Value, params: Option<&Value>, hub: &mut SerialHub) -> Value {
         return rpc_error(id, -32602, "unknown tool");
     }
 
+    let options = match response_options(&mut arguments) {
+        Ok(options) => options,
+        Err(error) => return rpc_error(id, -32602, &error.message),
+    };
+
     let result: Result<Value, ToolError> = match name {
+        "serial_get_output" => decode::<OutputArgs>(&arguments).and_then(|args| {
+            if !matches!(args.field.as_str(), "data" | "hex" | "raw_data") {
+                return Err(ToolError::invalid_params(
+                    "field must be data, hex, or raw_data",
+                ));
+            }
+            if !(4..=1_048_576).contains(&args.limit) {
+                return Err(ToolError::invalid_params(
+                    "limit must be between 4 and 1048576",
+                ));
+            }
+            output::page(
+                &args.output_id,
+                &args.field,
+                args.offset,
+                args.limit.min(options.1),
+            )
+            .map_err(ToolError::tool)
+        }),
+        "serial_cancel" => Err(ToolError::tool(
+            "no cancellable operation is running on this port",
+        )),
+        "serial_select" => decode::<SelectArgs>(&arguments).and_then(|args| {
+            validate_port_string(&args.port)?;
+            hub.select_port(&args.port)
+                .map(|value| json!(value))
+                .map_err(ToolError::tool)
+        }),
+        "serial_send_key" => decode::<KeyArgs>(&arguments).and_then(|args| {
+            if let Some(port) = &args.port {
+                validate_port_string(port)?;
+            }
+            let bytes = terminal::key_bytes(&args.key).ok_or_else(|| {
+                ToolError::invalid_params("unsupported key; see inputSchema enum")
+            })?;
+            require_terminal(hub, args.port.as_deref())?;
+            hub.write_bytes(args.port.as_deref(), bytes, "hex")
+                .map(|value| json!(value))
+                .map_err(ToolError::tool)
+        }),
+        "serial_exec" => decode::<ExecArgs>(&arguments).and_then(|args| {
+            if let Some(port) = &args.port {
+                validate_port_string(port)?;
+            }
+            validate_timeout(args.timeout_ms)?;
+            validate_max_bytes(args.max_bytes)?;
+            if args.command.is_empty() || args.command.len() > 65_536 || args.command.contains('\0')
+            {
+                return Err(ToolError::invalid_params(
+                    "command must contain 1..65536 bytes without NUL",
+                ));
+            }
+            require_terminal(hub, args.port.as_deref())?;
+            let shell = ShellCommand::for_exec(&args.command);
+            let result = hub
+                .run_command(
+                    args.port.as_deref(),
+                    &shell.payload,
+                    args.timeout_ms,
+                    300,
+                    args.max_bytes,
+                    Some(&shell.end),
+                    args.clear_input,
+                    false,
+                    "text",
+                    true,
+                )
+                .map_err(ToolError::tool)?;
+            let (data, exit_code) = shell.parse(result.raw_data.as_bytes());
+            let mut value = json!(result);
+            value["data"] = json!(String::from_utf8_lossy(&terminal::strip_ansi_bytes(&data)));
+            value["exit_code"] = json!(exit_code);
+            value["completed"] = json!(exit_code.is_some());
+            value["remote_may_be_running"] = json!(exit_code.is_none());
+            if exit_code.is_some() {
+                value["stop_reason"] = json!("completed");
+            }
+            Ok(value)
+        }),
+        "serial_exchange" => decode::<ExchangeArgs>(&arguments).and_then(|args| {
+            if let Some(port) = &args.port {
+                validate_port_string(port)?;
+            }
+            validate_timeout(args.timeout_ms)?;
+            validate_max_bytes(args.max_bytes)?;
+            validate_line_ending(&args.line_ending)?;
+            if let Some(encoding) = &args.terminator_encoding {
+                validate_encoding(encoding)?;
+            }
+            if args.terminator_encoding.is_some() && args.terminator.is_none() {
+                return Err(ToolError::invalid_params(
+                    "terminator_encoding requires terminator",
+                ));
+            }
+            if args.data.is_empty() {
+                return Err(ToolError::invalid_params("data must not be empty"));
+            }
+            let encoding = effective_encoding(args.encoding.as_deref(), hub, args.port.as_deref())?;
+            validate_encoding(encoding)?;
+            let response_encoding = args.response_encoding.as_deref().unwrap_or(encoding);
+            validate_encoding(response_encoding)?;
+            if let Some(idle) = args.idle_timeout_ms {
+                validate_timeout(idle)?;
+                if idle > args.timeout_ms {
+                    return Err(ToolError::invalid_params(
+                        "idle_timeout_ms must not exceed timeout_ms",
+                    ));
+                }
+            }
+            let mut payload = encode_data(&args.data, encoding)?;
+            append_line_ending(&mut payload, &args.line_ending);
+            let terminator = args
+                .terminator
+                .as_deref()
+                .map(|text| {
+                    encode_data(
+                        text,
+                        args.terminator_encoding
+                            .as_deref()
+                            .unwrap_or(response_encoding),
+                    )
+                })
+                .transpose()?;
+            if let Some(bytes) = &terminator
+                && (bytes.is_empty() || bytes.len() > 1024)
+            {
+                return Err(ToolError::invalid_params(
+                    "terminator must contain 1..1024 bytes",
+                ));
+            }
+            // No idle timeout unless explicitly requested. Exact byte counts use max_bytes.
+            let idle = args.idle_timeout_ms.unwrap_or(args.timeout_ms);
+            hub.run_command(
+                args.port.as_deref(),
+                &payload,
+                args.timeout_ms,
+                idle,
+                args.max_bytes,
+                terminator.as_deref(),
+                args.clear_input,
+                false,
+                response_encoding,
+                false,
+            )
+            .map(|value| {
+                let mut value = json!(value);
+                value["encoding"] = json!(response_encoding);
+                value
+            })
+            .map_err(ToolError::tool)
+        }),
         "serial_list_ports" => decode::<EmptyArgs>(&arguments).and_then(|_| {
             SerialHub::list_ports()
                 .map(|value| json!(value))
@@ -133,6 +296,7 @@ fn call_tool(id: Value, params: Option<&Value>, hub: &mut SerialHub) -> Value {
                         parity: args.parity,
                         flow_control: args.flow_control,
                         timeout_ms: args.timeout_ms,
+                        profile: args.profile,
                     },
                 )
                 .map(|value| json!(value))
@@ -164,6 +328,7 @@ fn call_tool(id: Value, params: Option<&Value>, hub: &mut SerialHub) -> Value {
                         parity: args.parity,
                         flow_control: args.flow_control,
                         timeout_ms: args.timeout_ms,
+                        profile: args.profile,
                     },
                 )
                 .map(|value| json!(value))
@@ -172,23 +337,37 @@ fn call_tool(id: Value, params: Option<&Value>, hub: &mut SerialHub) -> Value {
         "serial_write" => decode::<WriteArgs>(&arguments)
             .and_then(validate_write_args)
             .and_then(|args| {
-                let encoding = args.encoding.clone();
-                let mut data = encode_data(&args.data, &encoding)?;
+                let encoding =
+                    effective_encoding(args.encoding.as_deref(), hub, args.port.as_deref())?;
+                let mut data = encode_data(&args.data, encoding)?;
                 append_line_ending(&mut data, &args.line_ending);
-                hub.write_bytes(args.port.as_deref(), &data, &encoding)
+                hub.write_bytes(args.port.as_deref(), &data, encoding)
                     .map(|value| json!(value))
                     .map_err(ToolError::tool)
             }),
         "serial_read" => decode::<ReadArgs>(&arguments)
             .and_then(validate_read_args)
             .and_then(|args| {
+                let encoding =
+                    effective_encoding(args.encoding.as_deref(), hub, args.port.as_deref())?;
+                let terminator = args
+                    .terminator
+                    .as_deref()
+                    .map(|text| {
+                        encode_data(
+                            text,
+                            args.terminator_encoding.as_deref().unwrap_or(encoding),
+                        )
+                    })
+                    .transpose()?;
                 hub.read_bytes(
                     args.port.as_deref(),
                     args.timeout_ms,
                     args.max_bytes,
-                    &args.encoding,
+                    encoding,
                     &args.until,
-                    args.terminator.as_deref().map(str::as_bytes),
+                    terminator.as_deref(),
+                    args.idle_timeout_ms,
                 )
                 .map(|value| json!(value))
                 .map_err(ToolError::tool)
@@ -196,6 +375,7 @@ fn call_tool(id: Value, params: Option<&Value>, hub: &mut SerialHub) -> Value {
         "serial_run_command" => decode::<RunCommandArgs>(&arguments)
             .and_then(validate_run_command_args)
             .and_then(|args| {
+                require_terminal(hub, args.port.as_deref())?;
                 let mut payload = args.command.into_bytes();
                 append_line_ending(&mut payload, &args.line_ending);
                 hub.run_command(
@@ -207,6 +387,8 @@ fn call_tool(id: Value, params: Option<&Value>, hub: &mut SerialHub) -> Value {
                     args.until.as_deref().map(str::as_bytes),
                     args.clear_input,
                     args.strip_ansi,
+                    "text",
+                    false,
                 )
                 .map(|value| json!(value))
                 .map_err(ToolError::tool)
@@ -214,6 +396,7 @@ fn call_tool(id: Value, params: Option<&Value>, hub: &mut SerialHub) -> Value {
         "serial_check_modem_tools" => decode::<ModemToolCheckArgs>(&arguments)
             .and_then(validate_modem_tool_check_args)
             .and_then(|args| {
+                require_terminal(hub, args.port.as_deref())?;
                 hub.check_modem_tools(args.port.as_deref(), args.timeout_ms)
                     .map(|value| json!(value))
                     .map_err(ToolError::tool)
@@ -221,6 +404,11 @@ fn call_tool(id: Value, params: Option<&Value>, hub: &mut SerialHub) -> Value {
         "serial_send_file" => decode::<FileTransferArgs>(&arguments)
             .and_then(validate_send_file_args)
             .and_then(|args| {
+                if args.start_command
+                    && (args.command.is_none() || args.shell_command == Some(true))
+                {
+                    require_terminal(hub, args.port.as_deref())?;
+                }
                 let command = transfer_command(&args, true)?;
                 hub.send_file(
                     args.port.as_deref(),
@@ -229,6 +417,7 @@ fn call_tool(id: Value, params: Option<&Value>, hub: &mut SerialHub) -> Value {
                     args.remote_path.as_deref(),
                     command.as_deref(),
                     args.timeout_ms,
+                    args.shell_command.unwrap_or(args.command.is_none()),
                 )
                 .map(|value| json!(value))
                 .map_err(ToolError::tool)
@@ -236,6 +425,11 @@ fn call_tool(id: Value, params: Option<&Value>, hub: &mut SerialHub) -> Value {
         "serial_receive_file" => decode::<FileTransferArgs>(&arguments)
             .and_then(validate_receive_file_args)
             .and_then(|args| {
+                if args.start_command
+                    && (args.command.is_none() || args.shell_command == Some(true))
+                {
+                    require_terminal(hub, args.port.as_deref())?;
+                }
                 let command = transfer_command(&args, false)?;
                 hub.receive_file(
                     args.port.as_deref(),
@@ -244,6 +438,7 @@ fn call_tool(id: Value, params: Option<&Value>, hub: &mut SerialHub) -> Value {
                     args.remote_path.as_deref(),
                     command.as_deref(),
                     args.timeout_ms,
+                    args.shell_command.unwrap_or(args.command.is_none()),
                 )
                 .map(|value| json!(value))
                 .map_err(ToolError::tool)
@@ -267,34 +462,130 @@ fn call_tool(id: Value, params: Option<&Value>, hub: &mut SerialHub) -> Value {
     };
 
     match result {
-        Ok(value) => rpc_result(id, successful_tool_result(name, value)),
+        Ok(value) => rpc_result(id, output::success(name, value, options.0, options.1)),
         Err(error) if error.kind == "invalid_params" => rpc_error(id, -32602, &error.message),
         Err(error) => rpc_result(id, error_tool_result(&error.message)),
     }
 }
 
-fn successful_tool_result(name: &str, value: Value) -> Value {
-    if matches!(name, "serial_read" | "serial_run_command") {
-        let text = value
-            .get("data")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        json!({
-            "content": [{"type": "text", "text": text}],
-            "structuredContent": value,
-            "isError": false
-        })
-    } else {
-        let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string());
-        json!({
-            "content": [{"type": "text", "text": text}],
-            "structuredContent": value,
-            "isError": false
-        })
+pub(crate) fn valid_request(message: &Value) -> bool {
+    message.as_object().is_some_and(|object| {
+        object.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
+            && object.get("method").is_some_and(Value::is_string)
+            && object
+                .get("id")
+                .is_none_or(|id| id.is_null() || id.is_string() || id.is_number())
+            && object
+                .get("params")
+                .is_none_or(|params| params.is_object() || params.is_array())
+    })
+}
+
+fn effective_encoding<'a>(
+    encoding: Option<&'a str>,
+    hub: &SerialHub,
+    port: Option<&str>,
+) -> Result<&'a str, ToolError> {
+    match encoding {
+        Some(value) => Ok(value),
+        None => hub
+            .profile(port)
+            .map(|profile| profile.encoding())
+            .map_err(ToolError::tool),
     }
 }
 
-fn error_tool_result(message: &str) -> Value {
+fn require_terminal(hub: &SerialHub, port: Option<&str>) -> Result<(), ToolError> {
+    if hub.profile(port).map_err(ToolError::tool)? == Profile::Binary {
+        Err(ToolError::tool(
+            "this operation requires profile=terminal; use serial_exchange/read/write for binary devices",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn response_options(arguments: &mut Value) -> Result<(ResponseMode, usize), ToolError> {
+    let mode = arguments
+        .as_object_mut()
+        .and_then(|object| object.remove("response_mode"))
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|_| ToolError::invalid_params("response_mode must be compact or detailed"))?
+        .unwrap_or_default();
+    let limit = arguments
+        .as_object_mut()
+        .and_then(|object| object.remove("output_limit"))
+        .map(serde_json::from_value::<usize>)
+        .transpose()
+        .map_err(|_| ToolError::invalid_params("output_limit must be an integer"))?
+        .unwrap_or(output::DEFAULT_OUTPUT_LIMIT);
+    if !(4..=1_048_576).contains(&limit) {
+        return Err(ToolError::invalid_params(
+            "output_limit must be between 4 and 1048576",
+        ));
+    }
+    Ok((mode, limit))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SelectArgs {
+    port: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeyArgs {
+    port: Option<String>,
+    key: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OutputArgs {
+    output_id: String,
+    #[serde(default = "default_output_field")]
+    field: String,
+    #[serde(default)]
+    offset: usize,
+    #[serde(default = "default_max_bytes")]
+    limit: usize,
+}
+fn default_output_field() -> String {
+    "data".into()
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExecArgs {
+    port: Option<String>,
+    command: String,
+    #[serde(default = "default_command_timeout_ms")]
+    timeout_ms: u64,
+    #[serde(default = "default_command_max_bytes")]
+    max_bytes: usize,
+    #[serde(default)]
+    clear_input: bool,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExchangeArgs {
+    port: Option<String>,
+    data: String,
+    encoding: Option<String>,
+    response_encoding: Option<String>,
+    #[serde(default = "default_no_line_ending")]
+    line_ending: String,
+    #[serde(default = "default_timeout_ms")]
+    timeout_ms: u64,
+    #[serde(default = "default_max_bytes")]
+    max_bytes: usize,
+    terminator: Option<String>,
+    terminator_encoding: Option<String>,
+    idle_timeout_ms: Option<u64>,
+    #[serde(default)]
+    clear_input: bool,
+}
+
+pub(crate) fn error_tool_result(message: &str) -> Value {
     json!({
         "content": [{"type": "text", "text": message}],
         "structuredContent": {"error": message},
@@ -302,11 +593,11 @@ fn error_tool_result(message: &str) -> Value {
     })
 }
 
-fn rpc_result(id: Value, result: Value) -> Value {
+pub(crate) fn rpc_result(id: Value, result: Value) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "result": result})
 }
 
-fn rpc_error(id: Value, code: i64, message: &str) -> Value {
+pub(crate) fn rpc_error(id: Value, code: i64, message: &str) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
 }
 
@@ -341,6 +632,8 @@ struct OpenArgs {
     flow_control: String,
     #[serde(default = "default_timeout_ms")]
     timeout_ms: u64,
+    #[serde(default)]
+    profile: Profile,
 }
 
 #[derive(Deserialize)]
@@ -361,6 +654,7 @@ struct ConfigureArgs {
     parity: Option<String>,
     flow_control: Option<String>,
     timeout_ms: Option<u64>,
+    profile: Option<Profile>,
 }
 
 #[derive(Deserialize)]
@@ -368,8 +662,7 @@ struct ConfigureArgs {
 struct WriteArgs {
     port: Option<String>,
     data: String,
-    #[serde(default = "default_encoding")]
-    encoding: String,
+    encoding: Option<String>,
     #[serde(default = "default_no_line_ending")]
     line_ending: String,
 }
@@ -382,11 +675,12 @@ struct ReadArgs {
     timeout_ms: u64,
     #[serde(default = "default_max_bytes")]
     max_bytes: usize,
-    #[serde(default = "default_encoding")]
-    encoding: String,
+    encoding: Option<String>,
     #[serde(default = "default_until")]
     until: String,
     terminator: Option<String>,
+    terminator_encoding: Option<String>,
+    idle_timeout_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -403,7 +697,7 @@ struct RunCommandArgs {
     #[serde(default = "default_command_max_bytes")]
     max_bytes: usize,
     until: Option<String>,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     clear_input: bool,
     #[serde(default = "default_true")]
     strip_ansi: bool,
@@ -437,6 +731,7 @@ struct FileTransferArgs {
     command: Option<String>,
     #[serde(default = "default_true")]
     start_command: bool,
+    shell_command: Option<bool>,
     #[serde(default = "default_transfer_timeout_ms")]
     timeout_ms: u64,
 }
@@ -466,9 +761,6 @@ fn default_flow_control() -> String {
 }
 fn default_timeout_ms() -> u64 {
     DEFAULT_TIMEOUT_MS
-}
-fn default_encoding() -> String {
-    "text".to_string()
 }
 fn default_until() -> String {
     "timeout".to_string()
@@ -543,6 +835,7 @@ fn validate_configure_args(args: ConfigureArgs) -> Result<ConfigureArgs, ToolErr
         && args.parity.is_none()
         && args.flow_control.is_none()
         && args.timeout_ms.is_none()
+        && args.profile.is_none()
     {
         return Err(ToolError::invalid_params(
             "at least one serial setting is required",
@@ -572,7 +865,9 @@ fn validate_write_args(args: WriteArgs) -> Result<WriteArgs, ToolError> {
     if args.data.is_empty() {
         return Err(ToolError::invalid_params("data must not be empty"));
     }
-    validate_encoding(&args.encoding)?;
+    if let Some(encoding) = &args.encoding {
+        validate_encoding(encoding)?;
+    }
     validate_line_ending(&args.line_ending)?;
     Ok(args)
 }
@@ -582,8 +877,26 @@ fn validate_read_args(args: ReadArgs) -> Result<ReadArgs, ToolError> {
         validate_port_string(port)?;
     }
     validate_timeout(args.timeout_ms)?;
+    if args.terminator_encoding.is_some() && args.terminator.is_none() {
+        return Err(ToolError::invalid_params(
+            "terminator_encoding requires terminator",
+        ));
+    }
     validate_max_bytes(args.max_bytes)?;
-    validate_encoding(&args.encoding)?;
+    if let Some(idle) = args.idle_timeout_ms {
+        validate_timeout(idle)?;
+        if idle > args.timeout_ms {
+            return Err(ToolError::invalid_params(
+                "idle_timeout_ms must not exceed timeout_ms",
+            ));
+        }
+    }
+    if let Some(encoding) = &args.terminator_encoding {
+        validate_encoding(encoding)?;
+    }
+    if let Some(encoding) = &args.encoding {
+        validate_encoding(encoding)?;
+    }
     if !matches!(args.until.as_str(), "timeout" | "line" | "sequence") {
         return Err(ToolError::invalid_params(
             "until must be timeout, line, or sequence",
@@ -700,6 +1013,14 @@ fn validate_file_transfer_args(args: &FileTransferArgs) -> Result<(), ToolError>
     if args.local_path.trim().is_empty() {
         return Err(ToolError::invalid_params("local_path must not be empty"));
     }
+    if args.local_path.contains('\0')
+        || args
+            .remote_path
+            .as_ref()
+            .is_some_and(|path| path.contains('\0'))
+    {
+        return Err(ToolError::invalid_params("file paths must not contain NUL"));
+    }
     if let Some(remote_path) = args.remote_path.as_deref()
         && remote_path.trim().is_empty()
     {
@@ -713,7 +1034,15 @@ fn validate_file_transfer_args(args: &FileTransferArgs) -> Result<(), ToolError>
             "protocol must be xmodem, xmodem-1k, ymodem, or zmodem",
         ));
     }
+    if args.shell_command == Some(true) && !args.start_command {
+        return Err(ToolError::invalid_params(
+            "shell_command=true requires start_command=true",
+        ));
+    }
     if let Some(command) = args.command.as_deref() {
+        if command.contains('\0') {
+            return Err(ToolError::invalid_params("command must not contain NUL"));
+        }
         if command.trim().is_empty() {
             return Err(ToolError::invalid_params("command must not be empty"));
         }
@@ -749,17 +1078,17 @@ fn transfer_command(args: &FileTransferArgs, sending: bool) -> Result<Option<Str
                 "lrz",
                 &format!(
                     "-X -c -y {}",
-                    shell_quote(args.remote_path.as_deref().unwrap_or_default())
+                    remote_file_arg(args.remote_path.as_deref().unwrap_or_default())
                 ),
                 "rx",
-                &shell_quote(args.remote_path.as_deref().unwrap_or_default()),
+                &remote_file_arg(args.remote_path.as_deref().unwrap_or_default()),
             ),
             "ymodem" => modem_command("lrz", "--ymodem -y", "rb", ""),
             "zmodem" => modem_command("lrz", "-y", "rz", "-y"),
             _ => return Err(ToolError::invalid_params("unsupported modem protocol")),
         }))
     } else {
-        let remote_path = shell_quote(args.remote_path.as_deref().unwrap_or_default());
+        let remote_path = remote_file_arg(args.remote_path.as_deref().unwrap_or_default());
         Ok(Some(match args.protocol.as_str() {
             "xmodem" => modem_command("lsz", &format!("-X {remote_path}"), "sx", &remote_path),
             "xmodem-1k" => modem_command(
@@ -791,6 +1120,16 @@ fn modem_command(
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn remote_file_arg(path: &str) -> String {
+    // Shell quoting does not stop getopt interpreting a filename as an option.
+    // A relative ./ prefix also keeps a literal '-' from meaning standard input.
+    if path.starts_with('-') {
+        shell_quote(&format!("./{path}"))
+    } else {
+        shell_quote(path)
+    }
 }
 
 fn validate_port_string(port: &str) -> Result<(), ToolError> {
@@ -939,7 +1278,7 @@ fn parse_hex(data: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-fn tool_names() -> &'static [&'static str] {
+pub(crate) fn tool_names() -> &'static [&'static str] {
     &[
         "serial_list_ports",
         "serial_status",
@@ -947,6 +1286,12 @@ fn tool_names() -> &'static [&'static str] {
         "serial_reconnect",
         "serial_close",
         "serial_configure",
+        "serial_select",
+        "serial_exchange",
+        "serial_send_key",
+        "serial_exec",
+        "serial_get_output",
+        "serial_cancel",
         "serial_write",
         "serial_read",
         "serial_run_command",
@@ -955,221 +1300,6 @@ fn tool_names() -> &'static [&'static str] {
         "serial_receive_file",
         "serial_flush",
         "serial_set_control",
-    ]
-}
-
-fn tool_definitions() -> Vec<Value> {
-    vec![
-        json!({
-            "name": "serial_list_ports",
-            "description": "Get a live snapshot of available Windows COM ports and USB identity metadata. Call this before opening a port or when a board may have been replugged.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {},
-                "required": [],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "serial_status",
-            "description": "Re-enumerate hardware and report tracked ports as available, open, faulted, or disconnected. A disconnected active port remains selected so it can be reconnected without repeating its name.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {},
-                "required": [],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "serial_open",
-            "description": "Open and select a COM port for an embedded UART console. Defaults to 115200 8N1 with no flow control. Use serial_reconnect instead if the port is already tracked as disconnected.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "port": {"type": "string", "description": "COM port name, e.g. COM3 or \\\\.\\COM10"},
-                    "baud_rate": {"type": "integer", "minimum": 1, "maximum": 4000000, "default": 115200},
-                    "data_bits": {"type": "integer", "enum": [5, 6, 7, 8], "default": 8},
-                    "stop_bits": {"type": "integer", "enum": [1, 2], "default": 1},
-                    "parity": {"type": "string", "enum": ["none", "odd", "even"], "default": "none"},
-                    "flow_control": {"type": "string", "enum": ["none", "software", "hardware"], "default": "none"},
-                    "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 600000, "default": 1000}
-                },
-                "required": ["port"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "serial_reconnect",
-            "description": "Reopen a tracked port after USB hot-plug using its saved serial settings. Refuses a different USB identity unless force=true. Does not replay any failed write.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "port": {"type": "string", "description": "Tracked COM port; defaults to the active port"},
-                    "force": {"type": "boolean", "default": false, "description": "Allow reconnect when USB identity metadata changed"}
-                },
-                "required": [],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "serial_close",
-            "description": "Close and forget an open, faulted, or disconnected COM port. If omitted, port defaults to the active port.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "port": {"type": "string", "description": "COM port name; defaults to the active port"}
-                },
-                "required": [],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "serial_configure",
-            "description": "Change baud rate, data bits, stop bits, parity, flow control, or read timeout on an open port.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "port": {"type": "string", "description": "COM port name; defaults to the active port"},
-                    "baud_rate": {"type": "integer", "minimum": 1, "maximum": 4000000},
-                    "data_bits": {"type": "integer", "enum": [5, 6, 7, 8]},
-                    "stop_bits": {"type": "integer", "enum": [1, 2]},
-                    "parity": {"type": "string", "enum": ["none", "odd", "even"]},
-                    "flow_control": {"type": "string", "enum": ["none", "software", "hardware"]},
-                    "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 600000}
-                },
-                "required": [],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "serial_write",
-            "description": "Write text or hex bytes to an open port. Use serial_run_command for a Linux shell command that needs a collected response. Failed writes are never retried automatically.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "port": {"type": "string", "description": "COM port name; defaults to the active port"},
-                    "data": {"type": "string", "description": "Payload; text by default, or hex with optional spaces/0x prefix"},
-                    "encoding": {"type": "string", "enum": ["text", "hex"], "default": "text"},
-                    "line_ending": {"type": "string", "enum": ["none", "lf", "cr", "crlf"], "default": "none"}
-                },
-                "required": ["data"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "serial_read",
-            "description": "Read raw console bytes until an overall timeout, a line ending, an exact text sequence, or max_bytes. Returns text/hex and an explicit stop_reason.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "port": {"type": "string", "description": "COM port name; defaults to the active port"},
-                    "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 600000, "default": 1000},
-                    "max_bytes": {"type": "integer", "minimum": 1, "maximum": 1048576, "default": 4096},
-                    "encoding": {"type": "string", "enum": ["text", "hex"], "default": "text"},
-                    "until": {"type": "string", "enum": ["timeout", "line", "sequence"], "default": "timeout"},
-                    "terminator": {"type": "string", "minLength": 1, "maxLength": 1024, "description": "Exact UTF-8 sequence required when until=sequence"}
-                },
-                "required": [],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "serial_run_command",
-            "description": "Recommended tool for an embedded Linux shell: atomically send one command and collect its response. With until set, waits for that exact prompt/token; otherwise waits for the first byte and stops after the response becomes idle.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "port": {"type": "string", "description": "COM port name; defaults to the active port"},
-                    "command": {"type": "string", "maxLength": 65536, "description": "Shell command or terminal input"},
-                    "line_ending": {"type": "string", "enum": ["none", "lf", "cr", "crlf"], "default": "lf"},
-                    "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 600000, "default": 5000, "description": "Overall response deadline, including time to first byte"},
-                    "idle_timeout_ms": {"type": "integer", "minimum": 1, "maximum": 600000, "default": 300, "description": "Stop after this quiet period once data arrives; ignored when until is set"},
-                    "max_bytes": {"type": "integer", "minimum": 1, "maximum": 1048576, "default": 65536},
-                    "until": {"type": "string", "minLength": 1, "maxLength": 1024, "description": "Exact prompt or token to wait for, such as '# ' or 'login:'"},
-                    "clear_input": {"type": "boolean", "default": true, "description": "Discard unread input before sending so stale prompts cannot complete this command; set false to preserve boot/login output"},
-                    "strip_ansi": {"type": "boolean", "default": true, "description": "Remove ANSI terminal escapes from data while preserving raw_data and hex"}
-                },
-                "required": ["command"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "serial_check_modem_tools",
-            "description": "Probe the embedded Linux shell for lrz/lsz and compatible rz/sz/rx/sx/rb/sb modem commands. The probe is atomic and returns a boolean map.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "port": {"type": "string", "description": "COM port name; defaults to the active port"},
-                    "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 600000, "default": 10000}
-                },
-                "required": [],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "serial_send_file",
-            "description": "Atomically start a receiver on the embedded target and upload one local file over XMODEM, XMODEM-1K, YMODEM, or ZMODEM. Defaults to ZMODEM and selects lrz before falling back to rz. Set start_command=false only when the target receiver is already waiting.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "port": {"type": "string", "description": "COM port name; defaults to the active port"},
-                    "protocol": {"type": "string", "enum": ["xmodem", "xmodem-1k", "ymodem", "zmodem"], "default": "zmodem"},
-                    "local_path": {"type": "string", "minLength": 1, "description": "Path on the Windows host running serial-mcp"},
-                    "remote_path": {"type": "string", "minLength": 1, "description": "Target filename. Required for automatic XMODEM startup; used as transmitted filename for Y/ZMODEM."},
-                    "command": {"type": "string", "minLength": 1, "description": "Custom target receive command; overrides rx/rb/rz default"},
-                    "start_command": {"type": "boolean", "default": true, "description": "Send a target receive command before starting the protocol"},
-                    "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 600000, "default": 10000, "description": "Timeout for each protocol response"}
-                },
-                "required": ["local_path"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "serial_receive_file",
-            "description": "Atomically start a sender on the embedded target and download one file to the Windows host over XMODEM, XMODEM-1K, YMODEM, or ZMODEM. Defaults to ZMODEM and selects lsz before falling back to sz. Set start_command=false only when the target sender is already running.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "port": {"type": "string", "description": "COM port name; defaults to the active port"},
-                    "protocol": {"type": "string", "enum": ["xmodem", "xmodem-1k", "ymodem", "zmodem"], "default": "zmodem"},
-                    "local_path": {"type": "string", "minLength": 1, "description": "Destination path on the Windows host running serial-mcp"},
-                    "remote_path": {"type": "string", "minLength": 1, "description": "Source path on the embedded target; required for automatic startup"},
-                    "command": {"type": "string", "minLength": 1, "description": "Custom target send command; overrides sx/sb/sz default"},
-                    "start_command": {"type": "boolean", "default": true, "description": "Send a target send command before starting the protocol"},
-                    "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 600000, "default": 10000, "description": "Timeout for each protocol response"}
-                },
-                "required": ["local_path"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "serial_flush",
-            "description": "Discard pending input and/or output buffers on an open COM port.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "port": {"type": "string", "description": "COM port name; defaults to the active port"},
-                    "direction": {"type": "string", "enum": ["input", "output", "both"], "default": "both"}
-                },
-                "required": [],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "name": "serial_set_control",
-            "description": "Set DTR/RTS modem-control lines or send a serial break signal. Useful for board reset sequences.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "port": {"type": "string", "description": "COM port name; defaults to the active port"},
-                    "dtr": {"type": "boolean", "description": "Set Data Terminal Ready line"},
-                    "rts": {"type": "boolean", "description": "Set Request To Send line"},
-                    "break_ms": {"type": "integer", "minimum": 0, "maximum": 10000, "description": "Assert break for this many milliseconds"}
-                },
-                "required": [],
-                "additionalProperties": false
-            }
-        }),
     ]
 }
 
@@ -1271,6 +1401,85 @@ mod tests {
     }
 
     #[test]
+    fn schemas_cover_dispatch_and_share_output_options() {
+        let definitions = tool_definitions();
+        let names: std::collections::BTreeSet<_> = definitions
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names.len(), definitions.len());
+        assert_eq!(names, tool_names().iter().copied().collect());
+        for tool in definitions {
+            assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+            assert_eq!(
+                tool["inputSchema"]["properties"]["response_mode"]["default"],
+                "compact"
+            );
+            assert_eq!(
+                tool["inputSchema"]["properties"]["output_limit"]["default"],
+                output::DEFAULT_OUTPUT_LIMIT
+            );
+            for required in tool["inputSchema"]["required"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                assert!(
+                    tool["inputSchema"]["properties"]
+                        .get(required.as_str().unwrap())
+                        .is_some()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_arguments_fail_without_a_device() {
+        let invalid = [
+            ("serial_send_file", json!({"local_path":"bad\u{0}file.bin"})),
+            (
+                "serial_receive_file",
+                json!({"local_path":"local.bin","remote_path":"a\u{0}b"}),
+            ),
+            (
+                "serial_send_file",
+                json!({"local_path":"local.bin","command":"rz\u{0}"}),
+            ),
+            ("serial_write", json!({"data":"GG","encoding":"hex"})),
+            ("serial_write", json!({"data":"AA","encoding":"base64"})),
+            ("serial_read", json!({"until":"sequence"})),
+            ("serial_read", json!({"timeout_ms":1,"idle_timeout_ms":2})),
+            ("serial_read", json!({"max_bytes":0})),
+            ("serial_open", json!({"port":"COM3","profile":"linux"})),
+            ("serial_configure", json!({})),
+            ("serial_send_key", json!({"key":"unknown"})),
+            ("serial_get_output", json!({"output_id":"none","limit":1})),
+            ("serial_status", json!({"response_mode":"verbose"})),
+            ("serial_status", json!({"output_limit":3})),
+            ("serial_exec", json!({"command":"\u{0}"})),
+        ];
+        for (name, arguments) in invalid {
+            let response = handle_message(
+                message(
+                    "tools/call",
+                    Some(1),
+                    json!({"name":name,"arguments":arguments}),
+                ),
+                &mut SerialHub::new(),
+            )
+            .unwrap();
+            assert_eq!(response["error"]["code"], -32602, "{name}: {response}");
+        }
+        let response = handle_message(
+            json!({"jsonrpc":"2.0","id":[],"method":"tools/list"}),
+            &mut SerialHub::new(),
+        )
+        .unwrap();
+        assert_eq!(response["error"]["code"], -32600);
+        assert!(response["id"].is_null());
+    }
+
+    #[test]
     fn transfer_commands_use_protocol_defaults_and_quote_paths() {
         let args = FileTransferArgs {
             port: None,
@@ -1279,6 +1488,7 @@ mod tests {
             remote_path: Some("/tmp/it's.bin".to_string()),
             command: None,
             start_command: true,
+            shell_command: None,
             timeout_ms: 10_000,
         };
         let receive_command = transfer_command(&args, true).unwrap().unwrap();
@@ -1286,6 +1496,40 @@ mod tests {
 
         let send_command = transfer_command(&args, false).unwrap().unwrap();
         assert_eq!(send_command, "lsz '/tmp/it'\\''s.bin'");
+    }
+
+    #[test]
+    fn generated_file_commands_do_not_interpret_leading_dash_as_option() {
+        for protocol in ["xmodem", "xmodem-1k", "ymodem", "zmodem"] {
+            for path in ["-leading.bin", "-", "--help", "-it's 中文.bin"] {
+                let args: FileTransferArgs = serde_json::from_value(
+                    json!({"local_path":"fixture.bin", "remote_path":path, "protocol":protocol}),
+                )
+                .unwrap();
+                let receive = transfer_command(&args, false).unwrap().unwrap();
+                assert!(receive.ends_with(&shell_quote(&format!("./{path}"))));
+                if protocol.starts_with("xmodem") {
+                    assert!(
+                        transfer_command(&args, true)
+                            .unwrap()
+                            .unwrap()
+                            .ends_with(&shell_quote(&format!("./{path}")))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn transfer_paths_and_commands_reject_unrepresentable_nul() {
+        for arguments in [
+            json!({"local_path":"bad\u{0}file.bin"}),
+            json!({"local_path":"local.bin","remote_path":"a\u{0}b"}),
+            json!({"local_path":"local.bin","command":"rz\u{0}"}),
+        ] {
+            let args: FileTransferArgs = serde_json::from_value(arguments).unwrap();
+            assert!(validate_file_transfer_args(&args).is_err());
+        }
     }
 
     #[test]
@@ -1311,6 +1555,7 @@ mod tests {
             remote_path: None,
             command: None,
             start_command: true,
+            shell_command: None,
             timeout_ms: 10_000,
         };
         assert!(validate_receive_file_args(missing).is_err());
@@ -1322,6 +1567,7 @@ mod tests {
             remote_path: None,
             command: None,
             start_command: false,
+            shell_command: None,
             timeout_ms: 10_000,
         };
         assert!(validate_receive_file_args(manual).is_ok());
