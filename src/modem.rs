@@ -281,21 +281,39 @@ fn send_packet_with_retry<D: Read + Write>(
     expected_response: u8,
 ) -> io::Result<()> {
     let mut cancels = 0usize;
+    let mut garbage = 0usize;
     for _ in 0..MAX_RETRIES {
         device.write_all(encoded)?;
         device.flush()?;
-        match read_byte(device) {
-            Ok(value) if value == expected_response => return Ok(()),
-            Ok(CAN) => {
-                cancels += 1;
-                if cancels >= 2 {
-                    return Err(connection_aborted("peer canceled modem transfer"));
+        loop {
+            match read_byte(device) {
+                Ok(value) if value == expected_response => return Ok(()),
+                Ok(CAN) => {
+                    cancels += 1;
+                    if cancels >= 2 {
+                        return Err(connection_aborted("peer canceled modem transfer"));
+                    }
                 }
+                Ok(NAK) => {
+                    cancels = 0;
+                    break;
+                }
+                Ok(_) => {
+                    // Delayed CRC requests and diagnostic bytes are not NAKs.
+                    // Wait for the packet's response instead of flooding the peer.
+                    cancels = 0;
+                    garbage += 1;
+                    if garbage >= MAX_GARBAGE_BYTES {
+                        cancel(device)?;
+                        return Err(invalid_data("too much unexpected modem input"));
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+                    cancels = 0;
+                    break;
+                }
+                Err(error) => return Err(error),
             }
-            Ok(NAK) => {}
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::TimedOut => {}
-            Err(error) => return Err(error),
         }
     }
     cancel(device)?;
@@ -676,6 +694,43 @@ mod tests {
             &device.output[packet_len..packet_len * 2]
         );
         assert_eq!(device.output.last(), Some(&EOT));
+    }
+
+    #[test]
+    fn packet_sender_waits_through_extra_crc_requests_without_resending() {
+        for (one_k, block_size) in [(false, 128), (true, 1024)] {
+            let payload = vec![b'h'; block_size];
+            let mut input = vec![CRC_REQUEST; 40];
+            input.extend([ACK, ACK]);
+            let mut device = ScriptedDevice::with_input(input);
+            assert_eq!(
+                xmodem_send(&mut device, &payload, one_k).unwrap(),
+                block_size
+            );
+            let mut expected = packet(1, &payload, true);
+            expected.push(EOT);
+            assert_eq!(device.output, expected);
+        }
+    }
+
+    #[test]
+    fn packet_sender_bounds_unexpected_responses_and_cancels() {
+        let mut input = vec![CRC_REQUEST];
+        input.extend(std::iter::repeat_n(b'?', MAX_GARBAGE_BYTES));
+        let mut device = ScriptedDevice::with_input(input);
+        let error = xmodem_send(&mut device, b"hello", false).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let mut expected = packet(1, &padded(b"hello", 128), true);
+        expected.extend([CAN, CAN]);
+        assert_eq!(device.output, expected);
+    }
+
+    #[test]
+    fn packet_sender_honors_peer_cancel_without_resending() {
+        let mut device = ScriptedDevice::with_input([CRC_REQUEST, CAN, b'?', CAN, CAN]);
+        let error = xmodem_send(&mut device, b"hello", false).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+        assert_eq!(device.output, packet(1, &padded(b"hello", 128), true));
     }
 
     #[test]
